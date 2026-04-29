@@ -244,6 +244,12 @@ COMPONENT ila_iters
     signal sumrsta_busya3,sumrstb_busyb3,sumrsta_busya4,sumrstb_busyb4 :std_logic;
     signal codersta_busya :std_logic;
     signal workflag :std_logic;
+
+	------------------------------- iv_rate/BLK_K/BLK_2N buffer state --------------------
+	signal buffer_state : std_logic;
+	signal rate_buf1    : std_logic_vector(7 downto 0);
+	signal BLK_K_buf1   : std_logic_vector(7 downto 0);
+	signal BLK_2N_buf1  : std_logic_vector(8 downto 0);
 begin
 
 --Inst_clk_div : clk_div
@@ -301,7 +307,7 @@ begin
 		i_clk => i_clk,
 		i_rst => i_rst,
 		iv_len => iv_len,
-		iv_rate => iv_rate,
+		iv_rate => rate_buf1,
 		i_ctrl_en => ctrl_in,
 		o_pos_en => pos_en,
 		o_weight => weight,
@@ -413,7 +419,39 @@ begin
 		 rsta_busy => codersta_busya,
 		 dina => code_ram_dina,
 		 douta => code_ram_douta
-	  );	 
+	  );
+	buffer_state_pro : process(i_clk)	
+	begin
+        if(i_clk'event and i_clk = '1')then
+            if(i_rst = '1')then
+				buffer_state   	<= '0';
+			else
+			    if(cnt_out_360 = 358 and code_ram_addra = BLK_K_buf1)then
+					buffer_state   	<= '0';
+				elsif((llr_ram_addra = Blk_2N)and(llr_ram_wea = "1")) or ((llr_ram_addra = ("0"&Blk_2N(8 downto 1)))and(llr_ram_wea = "1"))then
+					buffer_state   	<= '1';
+				else
+					buffer_state    <= buffer_state;
+				end if;
+			end if;
+        end if;
+    end process;	
+	buffer_pro : process(i_clk)
+    begin
+        if(i_clk'event and i_clk = '1')then
+            if(i_rst = '1')then
+				rate_buf1   	<= (others => '0');
+				BLK_K_buf1  	<= (others => '0');
+				BLK_2N_buf1  	<= (others => '0');
+			else
+			    if (buffer_state = '0') and (i_llr_en = '1') then
+					rate_buf1 <= iv_rate;
+					BLK_K_buf1 <= BLK_K;
+					BLK_2N_buf1 <= BLK_2N;
+				end if;
+			end if;
+        end if;
+    end process;	
 	  
 	workflag_p : process(i_clk)
       begin
@@ -541,13 +579,13 @@ begin
 					if(state = '1')then
 						llr_ram_addrb <= "0"&pos;
 					else
-						llr_ram_addrb <= ("0"&pos) + ("0"&Blk_2N(8 downto 1));
+						llr_ram_addrb <= ("0"&pos) + ("0"&BLK_2N_buf1(8 downto 1));
 					end if;
 				elsif(decode_finish_en = '1')then
 					if(state = '1')then
 						llr_ram_addrb <= "0"&cnt_out;
 					else
-						llr_ram_addrb <= ("0"&cnt_out) + ("0"&Blk_2N(8 downto 1));
+						llr_ram_addrb <= ("0"&cnt_out) + ("0"&BLK_2N_buf1(8 downto 1));
 					end if;
 				else
 					llr_ram_addrb <= (others => '0');
@@ -838,7 +876,7 @@ begin
 			else
 				if(iterate_loop = max_iterate and ctrl_out_d7 = '1')then
 					decode_finish_en <= '1';
-				elsif(cnt_out = Blk_K)then
+				elsif(cnt_out = BLK_K_buf1)then
 					decode_finish_en <= '0';
 				else
 					decode_finish_en <= decode_finish_en;
@@ -853,7 +891,7 @@ begin
 				
 				if(decode_finish_en_d3 = '0' and decode_finish_en_d4 = '1')then
 					code_out_en <= '1';
-				elsif(cnt_out_360 = 358 and code_ram_addra = Blk_K)then--358
+				elsif(cnt_out_360 = 358 and code_ram_addra = BLK_K_buf1)then--358
 					code_out_en <= '0';
 				else
 					code_out_en <= code_out_en;
@@ -888,7 +926,7 @@ begin
 					code_ram_wea <= (others => '0');
 					code_ram_addra <= code_ram_addra + '1';
 					code_ram_dina <= (others => '0');
-				elsif(cnt_out_360 = 359 and code_ram_addra = Blk_K)then--359
+				elsif(cnt_out_360 = 359 and code_ram_addra = BLK_K_buf1)then--359
 					code_ram_wea <= (others => '0');
 					code_ram_addra <= (others => '0');
 					code_ram_dina <= (others => '0');
