@@ -1,0 +1,196 @@
+
+% 比较BIT-SD, MAX-LOG-MAP, 和 LOG-MAP 算法在256APSK下的SER性能
+clear; close all; clc;
+
+% 在脚本开头启动并行池（如果尚未启动）
+% CoreNum = 8;
+% if isempty(gcp('nocreate'))
+%     parpool('local', CoreNum); % CoreNum 为希望使用的核心数
+% end
+
+%% 1. 生成或加载256APSK星座图 (示例数据，需替换为您的实际数据)
+fprintf('Generating 256APSK constellation...\n');
+
+S2xWaveGen.SysPara.MODCOD         = 212; % [184 186 190 194 198] [174 178 180 182]
+S2xWaveGen.SysPara.VLSNRMode      = false;                 % 是否为甚低信噪比模式
+S2xWaveGen.SysPara.VLSNRModeIndex = 0;
+[S2xWaveGen,lock]                 = dvbs2x_MODCOD_initialization(S2xWaveGen);
+[constellation,mapping,~,~,~]     = dvbs2x_constellation(S2xWaveGen.SysPara.ModScheme{1},S2xWaveGen.SysPara.RadiusRatio{1});
+
+N = length(constellation);
+fprintf('Constellation generated with %d points.\n', N);
+
+%% 2. 预计算BIT-SD算法所需的查找表
+fprintf('Pre-computing opposite point lookup table for BIT-SD...\n');
+opposite_point_table = precompute_opposite_point_table(constellation, mapping);
+
+%% 3. 仿真参数设置
+SNR_dB_list         = 19.4;  % 信噪比范围 (dB)
+FrmNum              = 1;          % 每个SNR点仿真的帧数
+M                   = S2xWaveGen.SysPara.ConType;            % 调制阶数
+monte_carlo_runs    = 50;           % 蒙特卡洛仿真次数
+
+% 初始化SER结果存储
+SER_LOG_MAP         = zeros(size(SNR_dB_list));
+SER_MAX_LOG_MAP     = zeros(size(SNR_dB_list));
+SER_BIT_SD          = zeros(size(SNR_dB_list));
+
+BER_LOG_MAP         = zeros(size(SNR_dB_list));
+BER_MAX_LOG_MAP     = zeros(size(SNR_dB_list));
+BER_BIT_SD          = zeros(size(SNR_dB_list));
+%% 4. 编码/映射相关参数提取
+WorkFlag    = true; % 译码开关
+TxPara      = dvbs2x_parameter_configuration_v2(S2xWaveGen); 
+TxBitLen    = TxPara.BCH.K;
+
+%% 5. 主仿真循环
+fprintf('Starting Monte Carlo simulation...\n');
+rng(10)
+
+for snr_idx = 1:length(SNR_dB_list)
+    SNR_dB = SNR_dB_list(snr_idx);
+    fprintf('Simulating SNR = %.2f dB...\n', SNR_dB);
+    
+    ser_log_map_temp        = 0;
+    ser_max_log_map_temp    = 0;
+    ser_bit_sd_temp         = 0;
+    ber_log_map_temp        = 0;
+    ber_max_log_map_temp    = 0;
+    ber_bit_sd_temp         = 0;
+    
+    % 计算噪声方差
+    noise_var  = 10^(- SNR_dB / 10);% 对于平均功率为1的星座图
+    
+    for run = 1:FrmNum
+        fprintf('Current Frame_Num = %d ...\n', run);
+        % 发送比特生成
+        tx_bits     = randi([0 1],1,TxBitLen);
+        tx_bchOut   = dvbs2x_bchEncoder(tx_bits,TxPara.BCH.GF_mm,TxPara.BCH.GenPoly{1},TxPara.BCH.CorrectNum,TxPara.BCH.N,WorkFlag);
+        tx_ldpcOut  = dvbs2x_ldpcEncoder(tx_bchOut,TxPara.LDPC.H1{1},S2xWaveGen.SysPara.VLSNRModeIndex,WorkFlag);
+
+        % 映射
+        reshape_bits        = reshape(tx_ldpcOut,M,length(tx_ldpcOut)/M);
+        reshape_bits        = reshape_bits(M:-1:1,:);
+        tx_symbol_indices   = bi2de(reshape_bits');
+        [~, index]          = ismember(tx_symbol_indices, mapping); % 重变换
+        tx_symbols          = constellation(index);
+
+        % % 生成随机发送符号
+        % tx_symbol_indices   = randi([0, N-1], num_symbols, 1) + 1; % 1-based indices
+        % tx_symbols          = constellation(tx_symbol_indices);
+        
+        % 生成复高斯噪声
+        % channel.EsNo_dB     = SNR_dB;
+        % channel.normFreq    = 0;
+        % channel.phase       = 0;
+        % normFsym            = 1;
+        % [rx_symbols,awgn_symbols] = dvbs2x_channel_sim(tx_symbols,channel,normFsym);
+        rx_symbols  = awgn(tx_symbols, SNR_dB, 'measured'); % 加噪
+        
+        % 为每种算法初始化错误计数器
+        errors_log_map          = 0;
+        errors_max_log_map      = 0;
+        errors_bit_sd           = 0;
+        bit_errors_log_map      = 0;
+        bit_errors_max_log_map  = 0;
+        bit_errors_bit_sd_map   = 0;
+        
+        llr_log_map     = zeros(M,length(rx_symbols));
+        llr_max_log_map = zeros(M,length(rx_symbols));
+        llr_bit_sd      = zeros(M,length(rx_symbols));
+        
+        %% 对每个接收符号进行解调
+        for sym_idx = 1:length(rx_symbols)
+            r = rx_symbols(sym_idx);
+            
+            % --- LOG-MAP 算法 ---
+            llr_log_map(:,sym_idx) = demap_log_map(r, constellation, mapping, noise_var);
+
+            % hard_bits_log_map   = (llr_log_map < 0); % 硬判决用于SER比较
+            % rx_log_map_index    = hard_bits_log_map * (2.^(7:-1:0))';
+            % rx_log_map_bits     = dec2bin(rx_log_map_index,M);
+            % bit_errors_log_map  = bit_errors_log_map + sum(rx_log_map_bits ~= tx_bits);
+            
+            % --- MAX-LOG-MAP 算法 ---
+            llr_max_log_map(:,sym_idx) = demap_max_log_map(r, constellation, mapping, noise_var);
+            
+            % --- BIT-SD 算法 ---
+            % 第一步：快速硬判决（基于您图片中的比特分布几何特性）
+            hard_bits   = bit_sd_hard_decision(r, constellation, S2xWaveGen);
+            % 第二步：简化LLR计算
+            llr_bit_sd(:,sym_idx)  = bit_sd_soft_decision(r, hard_bits, constellation, mapping, opposite_point_table, noise_var);
+
+
+        end
+
+        llr_bits_log_map        = llr_log_map(:)';
+        llr_bits_max_log_map    = llr_max_log_map(:)';
+        llr_bits_bit_sd         = llr_bit_sd(:)';
+        
+        [~,rx_log_map_bits]     = dvbs2x_decode_top(llr_bits_log_map,TxPara,WorkFlag);
+        [~,rx_max_log_map_bits] = dvbs2x_decode_top(llr_bits_max_log_map,TxPara,WorkFlag);
+        [~,rx_bit_sd_map_bits]  = dvbs2x_decode_top(llr_bits_bit_sd,TxPara,WorkFlag);
+        
+        ber_log_map_temp        = ber_log_map_temp     + sum(rx_log_map_bits     ~= tx_bits);
+        ber_max_log_map_temp    = ber_max_log_map_temp + sum(rx_max_log_map_bits ~= tx_bits);
+        ber_bit_sd_temp         = ber_bit_sd_temp      + sum(rx_bit_sd_map_bits  ~= tx_bits);
+
+        %% 硬判决测试
+        hard_symbol_log_map     = hard_decison_aft_soft_demap(llr_bits_log_map);
+        hard_symbol_max_log_map = hard_decison_aft_soft_demap(llr_bits_max_log_map);
+        hard_symbol_bit_sd      = hard_decison_aft_soft_demap(llr_bits_bit_sd);
+        
+        ser_log_map_temp        = ser_log_map_temp      + sum(hard_symbol_log_map     ~= index.');
+        ser_max_log_map_temp    = ser_max_log_map_temp  + sum(hard_symbol_max_log_map ~= index.');
+        ser_bit_sd_temp         = ser_bit_sd_temp       + sum(hard_symbol_bit_sd      ~= index.');
+    end
+
+    % 平均多次蒙特卡洛运行结果
+    AllNum = FrmNum*TxBitLen;
+    SER_LOG_MAP(snr_idx)        = ser_log_map_temp * M / AllNum;
+    SER_MAX_LOG_MAP(snr_idx)    = ser_max_log_map_temp * M / AllNum;
+    SER_BIT_SD(snr_idx)         = ser_bit_sd_temp * M / AllNum;
+
+    BER_LOG_MAP(snr_idx)        = ber_log_map_temp / AllNum;
+    BER_MAX_LOG_MAP(snr_idx)    = ber_max_log_map_temp / AllNum;
+    BER_BIT_SD(snr_idx)         = ber_bit_sd_temp / AllNum;
+
+
+    fprintf('-- LOG-MAP BER = %.8f --\n', BER_LOG_MAP(snr_idx));
+    fprintf('-- MAX-LOG-MAP BER = %.8f --\n', BER_MAX_LOG_MAP(snr_idx));
+    fprintf('-- BIT-SD BER = %.8f --\n', BER_BIT_SD(snr_idx));
+end
+
+%% 5. 绘制性能比较图
+figure('Position', [100, 100, 1200, 800]);
+semilogy(SNR_dB_list, BER_LOG_MAP, 'b-o', 'LineWidth', 2, 'MarkerSize', 8, 'DisplayName', 'LOG-MAP');
+hold on;
+semilogy(SNR_dB_list, BER_MAX_LOG_MAP, 'r-s', 'LineWidth', 2, 'MarkerSize', 8, 'DisplayName', 'MAX-LOG-MAP');
+semilogy(SNR_dB_list, BER_BIT_SD, 'g-^', 'LineWidth', 2, 'MarkerSize', 8, 'DisplayName', 'BIT-BASED-MAP (Proposed)');
+
+grid on;
+xlabel('信噪比 (SNR, dB)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('BER', 'FontSize', 12, 'FontWeight', 'bold');
+title_name = sprintf("%s 不同软解映射算法性能比较",S2xWaveGen.SysPara.ModScheme{1});
+title(title_name, 'FontSize', 14, 'FontWeight', 'bold');
+legend('show', 'Location', 'southwest');
+set(gca, 'FontSize', 11);
+
+% % 添加性能差距标注
+% for i = 1:length(SNR_dB_list)
+%     if BER_BIT_SD(i) > 0 && BER_MAX_LOG_MAP(i) > 0
+%         gap_bit_sd = 10*log10(BER_BIT_SD(i)/BER_MAX_LOG_MAP(i));
+%         text(SNR_dB_list(i), BER_BIT_SD(i), sprintf('Δ=%.1fdB', gap_bit_sd), ...
+%              'FontSize', 8, 'HorizontalAlignment', 'center');
+%     end
+% end
+
+fprintf('Simulation completed!\n');
+
+
+%% 数据保存
+
+currentTimeStr = string(datetime('now', 'Format', 'yyyy-MM-dd_HH-mm-ss'));
+file_ber = sprintf("C:\\Users\\Administrator\\Desktop\\学业资料\\毕业设计\\代码\\SoftDemapping\\Simulation_Data\\TEST_BER_MODCOD-%d_TIME-%s.mat",S2xWaveGen.SysPara.MODCOD,currentTimeStr);
+save(file_ber,"SNR_dB_list","BER_LOG_MAP","BER_MAX_LOG_MAP","BER_BIT_SD");
+disp('----数据保存完成----');

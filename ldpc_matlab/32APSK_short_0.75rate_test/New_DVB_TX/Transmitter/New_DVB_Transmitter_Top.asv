@@ -1,0 +1,63 @@
+function TxFrame = New_DVB_Transmitter_Top(NewWaveGen)
+%  ////////////////////////////////////////////////////////////////////////
+%  Note：此发射机对照36所DVB项目的FPGA工程。在原DVB_Transmitter基础上简化。
+%           无链路层配置，不支持甚低信噪比，仅用于基带测试，验证接收机性能。
+%           每帧单独生成，目前只适配CCM模式，ACM模式可使用for语句循环生成
+% 
+%  Input：
+%    NewWaveGen —— 参数配置
+% 
+%  Output：
+%    TxFrame —— 物理层帧参数
+%
+%  Author: 郭志鹏
+%
+%  Date: 2026.01.09
+%
+%  Log:
+%  
+%  ////////////////////////////////////////////////////////////////////////
+
+SysPara.MODCOD      = NewWaveGen.MODCOD;
+Encoder_Work_Flag   = NewWaveGen.Encoder_Work_Flag;
+PLScram_Work_Flag   = NewWaveGen.PLScram_Work_Flag;
+PilotBlock          = ones(1,36)*exp(1j*pi/4); 
+VLSNRModeIndex      = 0; % 关闭VLSNR模式
+%% PARA GET
+[SysPara] = New_DVB_Modcod_Message_Get(SysPara.MODCOD);
+[SysPara] = New_DVB_BCH_LDPC_Encoder_Message_Get(SysPara);
+%% BCH & LDPC ENCODER & BIT INTERLEAVER
+if Encoder_Work_Flag == 1
+    TxBitLen    = SysPara.BCH.K;
+    % Raw_Bit     = randi([0 1],1,TxBitLen);
+    Polynomial  = [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 1]; % 生成多项式
+    Raw_Bit     = pn_generater_test(Polynomial,TxBitLen); %修改版pn_generater_test 与硬件对应
+    BCH_Bit     = dvbs2x_bchEncoder(Raw_Bit,SysPara.BCH.GF_mm,SysPara.BCH.GenPoly,SysPara.BCH.CorrectNum,SysPara.BCH.N,1);
+    LDPC_Bit    = dvbs2x_ldpcEncoder(BCH_Bit,SysPara.LDPC.H1,VLSNRModeIndex,1);
+    FecFrm      = New_DVB_Bit_InterLeaver(LDPC_Bit,SysPara.LDPC_LEN,SysPara.MODCOD,1);
+else
+    Raw_Bit     = randi([0 1],1,SysPara.LDPC_LEN);
+    BCH_Bit     = Raw_Bit;
+    LDPC_Bit    = BCH_Bit;
+    FecFrm      = LDPC_Bit;
+end
+%% MAPPING & FRAMING
+Map_Out = New_DVB_Mapping(FecFrm,SysPara.ConType,SysPara.ConMap);
+%Frm_Out = New_DVB_Framing(Map_Out,SysPara.PLFrm.PLSHeader,SysPara.LDPC_LEN,SysPara.ConType,SysPara.PilotType,PilotBlock);
+Frm_Out = Map_Out;
+%% PLSCRAMBLE
+if PLScram_Work_Flag == 1
+    PLS_Out = dvbs2x_PLSrambling(Frm_Out,0,SysPara.PLFrm.Rn);
+else
+    PLS_Out = Frm_Out;
+end
+%% OUTPUT DATA
+TxFrame.TxRawBit    = Raw_Bit;
+TxFrame.TxBchBit    = BCH_Bit;
+TxFrame.TxFecBit    = FecFrm;
+TxFrame.TxFrmOut    = Frm_Out;
+TxFrame.TxSymbol    = PLS_Out;
+TxFrame.TxFrmLen    = SysPara.PLFrm.frmLen;
+TxFrame.PLSHeader   = SysPara.PLFrm.PLSHeader;
+
+end

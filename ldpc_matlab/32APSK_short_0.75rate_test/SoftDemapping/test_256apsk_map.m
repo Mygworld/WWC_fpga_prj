@@ -1,0 +1,229 @@
+clear; close all; clc;
+%%
+S2xWaveGen.SysPara.MODCOD = 210; % [184 186 190 194 198] [174 178 180 182]
+[S2xWaveGen,lock] = dvbs2x_MODCOD_initialization(S2xWaveGen);
+% ModScheme = '128apsk';
+% radiusRatio = [1.715 2.118 2.681 2.75 3.819];
+for idx = 1:length(S2xWaveGen.SysPara.MODCOD)
+    [constellation,mapping,~,~,~] = dvbs2x_constellation(S2xWaveGen.SysPara.ModScheme{idx},S2xWaveGen.SysPara.RadiusRatio{idx});
+
+    % 运行主函数
+    plot_256apsk_constellation(constellation,dec2bin(mapping));
+
+    % 可选：运行动画演示（取消注释即可运行）
+    % animate_constellation_points();
+
+end
+
+% 绘制圆环
+% [~, boundary_index_all] = findpeaks(amplitude_diff, 'MinPeakHeight', 0);
+% index_new = [1;boundary_index_all+1];
+% num_rings = length(index_new);
+% theta = 0:0.01:2*pi;
+% figure;
+% for i = 1:num_rings
+%     % 绘制圆环轮廓
+%     x_ring = amplitudes(index_new(i)) * cos(theta);
+%     y_ring = amplitudes(index_new(i)) * sin(theta);
+%     plot(x_ring, y_ring, '--', 'Color', [114, 170, 207]/255, 'LineWidth', 1);
+%     hold on;
+%     % % 标注圆环半径
+%     % text(ring_radii(i)+0.05, 0, sprintf('R_%d=%.4f', i, ring_radii(i)), ...
+%     %      'FontSize', 9, 'Color', 'blue');
+% end
+
+% plot(constellation,'ro')
+
+function [] = plot_256apsk_constellation(constellation_data,labels)
+    % 清除环境
+    
+    % 创建图形窗口
+
+    % figure('Position', [100, 50, 1600, 1200], 'Color', 'white');
+    figure('Position', [100, 100, 1600, 800], ...
+           'Color', 'white', ...
+           'MenuBar', 'figure', ...
+           'ToolBar', 'auto', ...
+           'NumberTitle', 'on', ...
+           'WindowStyle', 'normal');
+    
+    % 提取实部和虚部
+    I = real(constellation_data);
+    Q = imag(constellation_data);
+    
+    % 主图：显示所有星座点
+    % subplot(2, 2, [1, 2, 3, 4]);
+    hold on; grid on; axis equal;
+    
+    % 为不同的比特位设置不同的颜色
+    bit_colors = [
+        1 0 0;    % 红色 - 比特0
+        0 0 1;    % 蓝色 - 比特1
+        0 1 0;    % 绿色 - 比特2  
+        1 0 1;    % 紫色 - 比特3
+        1 1 0;    % 黄色 - 比特4
+        0 1 1;    % 青色 - 比特5
+        1 0.5 0;  % 橙色 - 比特6
+        0.5 0 0.5 % 深紫 - 比特7
+    ];
+    
+    % 绘制每个星座点并标注
+    for i = 1:length(labels)
+        current_label = labels(i,:);
+        
+        % 根据比特位值确定颜色
+        point_color = [0 0 0]; % 默认黑色
+        for bit = 1:length(current_label)
+            if current_label(bit) == '1'
+                point_color = point_color + 0.1 * bit_colors(bit, :);
+            end
+        end
+
+        
+        % 绘制星座点
+        % scatter(I(i), Q(i), 100, 'filled', ...
+        %        'MarkerFaceColor', point_color, ...
+        %        'MarkerEdgeColor', 'k', ...
+        %        'LineWidth', 1);
+        
+        % 标注二进制标签
+        text(I(i) + 0.1, Q(i) + 0.1, current_label, ...
+            'FontSize', 8, 'FontWeight', 'bold', ...
+            'HorizontalAlignment', 'left');
+    end
+    
+    xlabel('同相分量 (I)', 'FontSize', 12, 'FontWeight', 'bold');
+    ylabel('正交分量 (Q)', 'FontSize', 12, 'FontWeight', 'bold');
+    title('DVB-S2X 非规则256APSK星座图 (码率20/30)', ...
+          'FontSize', 14, 'FontWeight', 'bold');
+    
+    % 添加坐标轴参考线
+    plot([-2, 2], [0, 0], '--', 'Color', [0.3 0.3 0.3], 'LineWidth', 0.5);
+    plot([0, 0], [-2, 2], '--', 'Color', [0.3 0.3 0.3], 'LineWidth', 0.5);
+    
+    xlim([-2.5, 2.5]);
+    ylim([-2.5, 2.5]);
+    
+
+
+    figure('Position', [50, 50, 1600, 800], ...
+           'Color', 'white', ...
+           'MenuBar', 'figure', ...
+           'ToolBar', 'auto', ...
+           'NumberTitle', 'on', ...
+           'WindowStyle', 'normal');
+
+    % 比特位分布分析子图
+    for idx = 1: size(labels,2)
+        % subplot(3, 3, idx);
+        figure;
+        % 设置坐标轴字体为Times New Roman
+        set(gca, 'FontSize', 10, 'FontName', 'Times New Roman');
+        title_str = sprintf('bit%d Distribution',idx-1);
+        plot_bit_distribution(labels, I, Q, idx, title_str, bit_colors(1, :));
+    end
+
+    % subplot(3, 4, 4);
+    % plot_bit_distribution(labels, I, Q, 2, '第2比特位 (MSB) 分布', bit_colors(1, :));
+     
+    % subplot(3, 4, 7);
+    % plot_bit_distribution(labels, I, Q, 3, '第3比特位 (MSB) 分布', bit_colors(1, :));
+    % subplot(3, 4, 8);
+    % plot_bit_distribution(labels, I, Q, 4, '第4比特位 (MSB) 分布', bit_colors(1, :));
+     
+    % subplot(3, 4, 9);
+    % plot_bit_distribution(labels, I, Q, 5, '第5比特位 (MSB) 分布', bit_colors(1, :));
+    % subplot(3, 4, 10);
+    % plot_bit_distribution(labels, I, Q, 6, '第6比特位 (MSB) 分布', bit_colors(1, :));
+    % subplot(3, 4, 11);
+    % plot_bit_distribution(labels, I, Q, 7, '第7比特位 (MSB) 分布', bit_colors(1, :));
+    % subplot(3, 4, 12);
+    % plot_bit_distribution(labels, I, Q, 8, '第8比特位 (MSB) 分布', bit_colors(1, :));
+    
+    
+    % 添加图例
+
+    % subplot(3, 3, 1);
+    legend('Bit=0', 'Bit=1', 'Location', 'best');
+
+    fprintf('非规则256APSK星座图分析完成\n');
+    fprintf('总点数: %d\n', length(labels));
+    fprintf('坐标范围: I[%.3f, %.3f], Q[%.3f, %.3f]\n', ...
+            min(I), max(I), min(Q), max(Q));
+end
+
+function plot_bit_distribution(labels, I, Q, bit_position, title_str, color)
+    % 绘制特定比特位的分布情况
+    
+    hold on; grid on; axis equal;
+    
+    bit0_I = []; bit0_Q = [];
+    bit1_I = []; bit1_Q = [];
+    
+    for i = 1:length(labels)
+        if labels(i,bit_position) == '0'
+            bit0_I = [bit0_I; I(i)];
+            bit0_Q = [bit0_Q; Q(i)];
+        else
+            bit1_I = [bit1_I; I(i)];
+            bit1_Q = [bit1_Q; Q(i)];
+        end
+    end
+    
+    % 绘制比特位分布
+    if ~isempty(bit0_I)
+        scatter(bit0_I, bit0_Q, 20, 'filled', ...
+               'MarkerFaceColor', [1 0 0], 'MarkerEdgeColor', 'k');
+    end
+
+    if ~isempty(bit1_I)
+        scatter(bit1_I, bit1_Q, 20, 'filled', ...
+               'MarkerFaceColor', [0 0 1], 'MarkerEdgeColor', 'k');
+    end
+    
+    % xlabel('I'); ylabel('Q');
+    title(title_str, 'FontSize', 10, 'FontWeight', 'bold');
+    
+    % % 添加统计信息
+    % text(0.02, 0.98, sprintf('Bit=0: %d点\nBit=1: %d点', ...
+    %      length(bit0_I), length(bit1_I)), ...
+    %      'Units', 'normalized', 'FontSize', 9, ...
+    %      'BackgroundColor', 'white', 'VerticalAlignment', 'top');
+end
+
+% 辅助函数：逐点动画显示
+function animate_constellation_points()
+    % 创建动画显示每个点的出现过程
+    figure('Position', [200, 100, 1000, 800]);
+    
+    % 模拟完整的数据（实际需要256个点）
+    num_points = 64; % 简化演示
+    
+    hold on; grid on; axis equal;
+    xlabel('I'); ylabel('Q');
+    title('256APSK星座点逐点显示动画', 'FontSize', 14);
+    
+    % 生成模拟数据
+    theta = linspace(0, 2*pi, num_points);
+    radii = 1 + 0.5 * rand(1, num_points);
+    I = radii .* cos(theta);
+    Q = radii .* sin(theta);
+    
+    for i = 1:num_points
+        % 绘制当前点
+        scatter(I(i), Q(i), 80, 'filled', 'r');
+        
+        % 生成随机8位标签
+        label = dec2bin(randi([0, 255]), 8);
+        
+        % 标注标签
+        text(I(i) + 0.05, Q(i) + 0.05, label, ...
+             'FontSize', 7, 'FontWeight', 'bold');
+        
+        % 暂停以便观察
+        pause(0.1);
+        
+        % 更新图形
+        drawnow;
+    end
+end

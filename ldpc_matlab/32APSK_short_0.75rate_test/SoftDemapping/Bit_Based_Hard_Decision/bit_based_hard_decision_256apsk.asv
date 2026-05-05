@@ -1,0 +1,171 @@
+function [hard_bits] = bit_based_hard_decision_256apsk(mod_scheme,constellation,rx_symbol)
+    %% 256APSK 基于bit判决域的硬判决
+    % note:
+    %   mod_scheme      : 调制方案
+    %   constelltion    : 标准星座点
+    %   rx_symbol       : 接收信号
+    %   rx_amplitude    : 接收信号幅值
+    %   rx_phase        : 接收信号（映射到第一象限后）相位值
+    
+    M       = 8; % 调制阶数
+    N       = length(constellation); % 符号数
+    Alpha   = 1; % 幅值边界阈值调整参数
+    I       = real(rx_symbol); % 硬件实现中可以直接使用flag标志
+    Q       = imag(rx_symbol);
+
+    Boundary    = calculate_256APSK_Boundaries(constellation,mod_scheme);
+
+    % --- 关键步骤1: 从星座图中提取或定义幅值判决边界 ---
+    % 假设星座点已按幅度排序，我们可以提取大致的半径边界
+
+    % 对于非规则256APSK，需要特别区分一下（第一象限下）的幅值边界（以直线y=x为界）
+    % constellation_1st       = complex(abs(real(constellation)),abs(imag(constellation)));
+    % constellation_1st_p1    = constellation_1st(angle(constellation_1st) >= pi/4);
+    % constellation_1st_p2    = constellation_1st(angle(constellation_1st) <  pi/4);
+    % 
+    % sorted_constellation    = sort(constellation, 'ComparisonMethod', 'abs');
+    % sorted_constellation_p1 = sort(constellation_1st_p1, 'ComparisonMethod', 'abs');
+    % sorted_constellation_p2 = sort(constellation_1st_p2, 'ComparisonMethod', 'abs');
+    % 
+    % amplitude_circle1       = abs(sorted_constellation(1));
+    % 
+    Shift_Real              = 0; % 用于修正256apsk_3的偏差
+
+    % --- 接收信号重映射到第一象限 --- 
+    rx_symbol_1st           = complex(abs(real(rx_symbol)),abs(imag(rx_symbol)));
+    rx_amplitude            = abs(rx_symbol_1st);
+    if (mod_scheme == "256apsk_3")
+        rx_phase = angle(rx_symbol_1st + Shift_Real); % 采用偏移后的信号相位角 更为准确
+    else
+        rx_phase = angle(rx_symbol_1st);
+    end
+
+
+    % % 寻找幅度边界
+    % if (mod_scheme == "256apsk_2" || mod_scheme == "256apsk_3") % 256apsk 20/30和22/30
+    %     if (rx_phase >= pi/4) % 也即y>=x
+    %         amplitudes = abs(sorted_constellation_p1);
+    %     else
+    %         amplitudes = abs(sorted_constellation_p2);
+    %     end
+    % else
+    %     amplitudes = abs(sorted_constellation);
+    % end
+
+    % % 这里通过查找幅度值的显著跳变来估计圆环边界
+    % amplitude_diff      = diff(amplitudes);
+    % [~, boundary_index] = findpeaks(amplitude_diff, 'MinPeakHeight', max(amplitude_diff)/4);
+    % 
+    % 
+    % boundary_radii      = Alpha * [amplitudes(1); amplitudes(boundary_index + 1)];
+
+    % 步骤1和2 其实可以提取到外部，不用加入循环之中;并且p1、p2对于规则星座点没有区别
+
+
+    % --- 关键步骤2: 从星座图中提取或定义相位判决边界 ---
+    % 定义相位扇区边界（用于比特5-7）
+    % APSK通常有不同数量的点分布在各个圆环上，导致相位扇区数不同。
+    % 这里定义一个通用的相位扇区映射（需要根据您的星座图调整）
+    % num_phase_sectors = [4, 8, 16, 32, 32, 32, 64, 64]; % 每个圆环的扇区数（示例）
+    % num_phase_sectors = [boundary_index(1),diff(boundary_index),N - boundary_index(end)]; % 适用于规则APSK
+
+    % num_phase_sectors   = [32 32 32 32 32 32 32 32];
+    % phase_steps         = 2*pi./num_phase_sectors;
+
+    if (mod_scheme == "256apsk_2" || mod_scheme == "256apsk_3")
+        if (rx_phase >= pi/4)
+            amplitude_boundaries = Boundary.amplitude_boundaries_p1;
+        else
+            amplitude_boundaries = Boundary.amplitude_boundaries_p2;
+        end
+    else
+        amplitude_boundaries = Boundary.amplitude_boundaries;
+    end
+    phase_boundaries = Boundary.phase_boundaries;
+
+    % --- 关键步骤3: 根据判决边界判定比特值 ---
+    % 初始化
+    hard_bits = false(1, M);
+    for bit = 1:M
+        switch bit
+            case 1  % 第1比特位 (MSB): 基于幅度，与第4/5圆环边界比较
+                if (mod_scheme == "256apsk_3") 
+                    threshold   = amplitude_boundaries(5);
+                else
+                    threshold   = amplitude_boundaries(4);
+                end
+                hard_bits(1)    = (rx_amplitude >= threshold);
+                
+            case 2  % 第2比特位: 基于幅度，在边界(2,3)和(6,7)之间
+                if (mod_scheme == "256apsk_3") 
+                    low_thresh  = amplitude_boundaries(3);
+                    high_thresh = amplitude_boundaries(7);
+                else
+                    low_thresh  = amplitude_boundaries(2);
+                    high_thresh = amplitude_boundaries(6);
+                end
+                hard_bits(2)    = (rx_amplitude >= low_thresh) & (rx_amplitude < high_thresh);
+                
+            case 3  % 第3比特位: 基于幅度
+                % 类似比特2，但使用不同的边界，例如边界(1)和(5)
+                if (mod_scheme == "256apsk_3") 
+                    thresh_1  = amplitude_boundaries(3);
+                    thresh_2  = amplitude_boundaries(3);
+                    thresh_3  = amplitude_boundaries(3);
+                    thresh_4  = amplitude_boundaries(3);
+                else
+                    thresh_1  = amplitude_boundaries(1);
+                    thresh_2  = amplitude_boundaries(3);
+                    thresh_3  = amplitude_boundaries(5);
+                    thresh_4  = amplitude_boundaries(7);
+                end
+                hard_bits(3)    = ((rx_amplitude >= thresh_1) & (rx_amplitude < thresh_2)) | ((rx_amplitude >= thresh_3) & (rx_amplitude < thresh_4));
+                
+            case 4  % 第4比特位: 基于虚部 (Q) 符号
+                hard_bits(4)    = (Q < 0);
+                
+            case 5  % 第5比特位: 基于实部 (I) 符号
+                hard_bits(5)    = (I < 0);
+                
+            case 6  % 第6比特位: 基于相位，判断属于哪个相位扇区
+                % 位于任一圆环4/5点边界
+                if (mod_scheme == "256apsk_3") % 256apsk 22/30
+                    threshold       = amplitude_boundaries(1);
+                    hard_bits(6)    = (rx_phase >= phase_boundaries(4)) | (rx_amplitude < threshold);
+                else
+                    hard_bits(6)    = (rx_phase >= phase_boundaries(4));
+                end
+
+            case 7  % 第7比特位: 基于相位
+                % 位于任一圆环2/3点边界和6/7点边界
+                if (mod_scheme == "256apsk_3") % 256apsk 22/30
+                    threshold       = amplitude_boundaries(1);
+                    hard_bits(7)    = (rx_phase >= phase_boundaries(2)) & (rx_phase < phase_boundaries(6)) & (rx_amplitude >= threshold);
+                else
+                    hard_bits(7)    = (rx_phase >= phase_boundaries(2)) & (rx_phase < phase_boundaries(6));
+                end
+                
+            case 8  % 第8比特位 (LSB): 基于更精细的相位
+                % 位于任一圆环1/2点边界和3/4点边界和7/8点边界
+                hard_bits(8)    = ((rx_phase >= phase_boundaries(1)) & (rx_phase < phase_boundaries(3))) | ((rx_phase >= phase_boundaries(5)) & (rx_phase < phase_boundaries(7)));
+                
+            otherwise
+                error('Bit position out of range for 256APSK.');
+        end
+    end
+
+    % --- 关键步骤4: 非规则256APSK比特重映射 ---  
+    % 部分比特位需要重新排序和翻转逻辑值
+    if (mod_scheme == "256apsk_2")
+        rearrange_index = [7 4 3 5 6 1 2 8];
+        reverse_index   = 1;
+    elseif  (mod_scheme == "256apsk_3")
+        rearrange_index = [6 8 7 2 4 1 5 3];
+        reverse_index   = 1;
+    else
+        rearrange_index = 1:M;
+        reverse_index   = [];
+    end
+    hard_bits(reverse_index) = ~hard_bits(reverse_index);
+    hard_bits = hard_bits(rearrange_index);
+end

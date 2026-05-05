@@ -1,0 +1,33 @@
+
+% function hard_bits = bit_sd_hard_decision(r, constellation, mapping)
+%     % BIT-SD算法的硬判决部分 - 基于几何特性的快速判决
+%     % 这里需要您根据具体的256APSK比特分布图来实现区域判决逻辑
+%     % 以下是一个简化示例，实际应根据您的分布图特性实现
+% 
+%     M = length(constellation);
+% 
+%     % 简化实现：直接找最近的星座点作为硬判决
+%     % 在实际BIT-SD中，这里应该是基于比特分布的区域判决，而不是全局搜索
+%     distances = abs(r - constellation);
+%     [~, hard_index] = min(distances);
+%     hard_bits = dec2bin(mapping(hard_index), 8);
+% end
+
+function hard_bits = bit_sd_hard_decision(rx_symbol, constellation, mapping)
+    % 基于几何特性的BIT-SD快速硬判决算法
+    % 输入:
+    %   r: 接收到的复信号符号
+    %   constellation: 256APSK星座点数组
+    %   mapping: 星座点对应的标签
+    % 输出:
+    %   hard_bits: 1x8的逻辑行向量，表示8个比特的硬判决结果（0=false, 1=true）
+
+    % 利用对称性，直接映射到第一象限
+    phase_angle_1st = angle(complex(abs(real(rx_symbol)),abs(imag(rx_symbol))));
+    phase_angle     = phase_angle_1st;
+
+    hard_bits = bit_based_hard_decision_256apsk(mod_scheme,constellation,rx_symbol,rx_amplitude,rx_phase);
+    
+    % 将逻辑值转换为0/1数值（如果需要）
+    % hard_bits = double(hard_bits);
+end
