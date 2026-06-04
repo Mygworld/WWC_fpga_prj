@@ -2,25 +2,19 @@
 -- Company: 
 -- Engineer: 
 -- 
--- Create Date:    13:10:43 05/22/2026
+-- Create Date:    2026-05-23 Wangweichen
 -- Design Name: 
--- Module Name:    LLR_Adjust - Behavioral 
+-- Module Name:    LLR_Adjust - Behavioral (Register Array Transpose)
 -- Project Name: 
 -- Target Devices: 
 -- Tool versions: 
--- Description: 
---
--- Dependencies: 
---
--- Revision: 0.01 - File Created
--- Revision: 0.02 - 8-channel input, 8-Bank Memory Duplication, Ping-Pong Buffered
---                  Zero Multipliers, Zero Type-Casting, 192MHz+ Timing Closure
--- Revision: 0.03 - Removed Ping-Pong, Fixed TX State Machine & Calc
+-- Description:    DVB-S2/S2X LLR Interleaver utilizing 1D Ping-Pong Register Array
+--                 to perform 48-bit to 48-bit Matrix Transposition.
 ----------------------------------------------------------------------------------
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
-use IEEE.STD_LOGIC_ARITH.ALL;
 use IEEE.STD_LOGIC_UNSIGNED.ALL;
+use IEEE.STD_LOGIC_ARITH.ALL;
 
 entity ldpc_decode_llr_adjust is
     Port ( i_clk    : in  STD_LOGIC;
@@ -36,419 +30,329 @@ entity ldpc_decode_llr_adjust is
 end ldpc_decode_llr_adjust;
 
 architecture Behavioral of ldpc_decode_llr_adjust is
-
--- 8-way LLR input parity bit interleaving (Ping-Pong removed, using single 8192 depth effectively)
--- width:8*6=48bit,depth:64800/8=8100->8192,inst 8
+    --------------------------------------------------------------------
+    -- Unified Single RAM Component (Depth 8192, Addr 13-bit)
+    --------------------------------------------------------------------
+    -- info bits wr directly,check bits register-adjusted then wr to matching addr
     COMPONENT ldpc_decode_llr_adjust_ram
       PORT (
         clka  : IN STD_LOGIC;
         wea   : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
-        addra : IN STD_LOGIC_VECTOR(12 DOWNTO 0); -- wr 8192 depth
-        dina  : IN STD_LOGIC_VECTOR(47 DOWNTO 0); -- wr 48 width
+        addra : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
+        dina  : IN STD_LOGIC_VECTOR(47 DOWNTO 0); -- 8-ch input
         clkb  : IN STD_LOGIC;
-        addrb : IN STD_LOGIC_VECTOR(15 DOWNTO 0); -- rd 65536 depth (for use idx)
-        doutb : OUT STD_LOGIC_VECTOR(5 DOWNTO 0)  -- rd 6 width (= llr)
-        );
+        addrb : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
+        doutb : OUT STD_LOGIC_VECTOR(47 DOWNTO 0) -- 8-ch adjusted output
+      );
     END COMPONENT;
-    -- COMPONENT parity_bram_48w_16384d
-    --   PORT (
-    --     clka  : IN STD_LOGIC;
-    --     wea   : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
-    --     addra : IN STD_LOGIC_VECTOR(13 DOWNTO 0);
-    --     dina  : IN STD_LOGIC_VECTOR(47 DOWNTO 0);
-    --     clkb  : IN STD_LOGIC;
-    --     addrb : IN STD_LOGIC_VECTOR(13 DOWNTO 0);
-    --     doutb : OUT STD_LOGIC_VECTOR(47 DOWNTO 0)
-    --   );
-    -- END COMPONENT;
 
--- Eight-frame output data from llr_adjust are stored in ping-pong RAMs, with an input of 45 pieces of 48-bit data
-	COMPONENT ldpc_decode_llr_ram_8frame
-	  PORT (
-		 clka : IN STD_LOGIC;
-		 wea : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
-		 addra : IN STD_LOGIC_VECTOR(11 DOWNTO 0);
-		 dina : IN STD_LOGIC_VECTOR(2159 DOWNTO 0);
-		 rstb : IN STD_LOGIC;
-		 clkb : IN STD_LOGIC;
-		 rsta_busy : OUT STD_LOGIC;
-         rstb_busy : OUT STD_LOGIC;
-		 addrb : IN STD_LOGIC_VECTOR(11 DOWNTO 0);
-		 doutb : OUT STD_LOGIC_VECTOR(2159 DOWNTO 0)
-	  );
-	END COMPONENT;
+    --------------------------------------------------------------------
+    -- DVB-S2/S2X Parameters
+    --------------------------------------------------------------------
+    signal Blk_K    : std_logic_vector(7 downto 0);       
+    signal Blk_N    : std_logic_vector(7 downto 0);  
+    signal LEN_N    : std_logic_vector(12 downto 0); -- max = 8099(13bits)
+    signal INFO_LEN : std_logic_vector(12 downto 0); -- max = 64800*9/10 /8 = 7290(13bits)
 
-	------------------------------------llr_adjust-------------------------------------
-    -- DVB-S2/S2X param
-    signal Blk_K : std_logic_vector(7 downto 0); -- normal-179/medium-89/short-44      
-    signal Blk_N : std_logic_vector(7 downto 0); -- by iv_rate and iv_len
-    signal q_val : std_logic_vector(8 downto 0); -- Blk_K + 1 - Blk_N
+    -- Q Multiplier Pre-calculation (Pure Combinational)
+    signal q_val : std_logic_vector(8 downto 0);
+    signal q_ext : std_logic_vector(10 downto 0);
+    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*7=980(10bits)
 
-    -- llr_adjust_ram input control
-    signal rx_cnt         : std_logic_vector(13 downto 0);
-    --signal ping_pong_wr   : std_logic := '0';
-    signal rx_toggle      : std_logic := '0';
-    --signal finished_bank  : std_logic := '0';
-    signal wea            : std_logic_vector(0 downto 0);
-    signal addra_full     : std_logic_vector(13 downto 0);
+    --------------------------------------------------------------------
+    -- 1D Ping-Pong Register Array Definition (1088 depth * 6-bit For Parity Chunk Transpose)
+    --------------------------------------------------------------------
+    -- 140 (max q) * 8 = 1120. We use 1120 for 8-byte alignment.
+    type reg_arr_t is array(0 to 1119) of std_logic_vector(5 downto 0);
+    signal ping_reg : reg_arr_t := (others => (others => '0'));
+    signal pong_reg : reg_arr_t := (others => (others => '0'));
 
-    -- frame length total num calu
-    signal N_plus_1       : std_logic_vector(8 downto 0);
-    signal N_p1_ext       : std_logic_vector(14 downto 0);
-    signal total_words    : std_logic_vector(14 downto 0);
+    --------------------------------------------------------------------
+    -- Control Signals
+    --------------------------------------------------------------------
+    -- Reg Control Signals(Process 1)
+    signal llr_in_cnt   : std_logic_vector(12 downto 0);
+    signal parity_q_cnt : std_logic_vector(8 downto 0);
+    signal parity_j_cnt : std_logic_vector(5 downto 0);
+    signal pp_arr_wr    : std_logic; 
 
-    -- llr_adjust_ram output state control
-    type state_type is (IDLE, TX_INFO_PREP, TX_INFO_RUN, TX_INFO_WAIT, TX_PARITY_PREP, TX_PARITY_RUN, TX_PARITY_WAIT);
-    signal tx_state       : state_type;
-    signal tx_toggle      : std_logic := '0';
-    -- signal ping_pong_rd   : std_logic := '0';
-    
-    signal tx_macro_row   : std_logic_vector(7 downto 0) := (others => '0');
-    signal m_cnt          : std_logic_vector(8 downto 0) := (others => '0');
-    signal j_cnt          : std_logic_vector(5 downto 0) := (others => '0');
-    
-    -- base addr + (replace Blk_K * 45)
-    signal info_base_addr : std_logic_vector(12 downto 0) := (others => '0');
-    signal seq_addr       : std_logic_vector(12 downto 0);
+    -- RAM Write Control Signals(Process 2)
+    signal tx_running   : std_logic;
+    signal tx_arr_sel   : std_logic;
+    signal tx_m_cnt     : std_logic_vector(8 downto 0);
+    signal tx_m_offset  : std_logic_vector(12 downto 0); -- Accumulator for M * 45
+    signal tx_j_cnt     : std_logic_vector(5 downto 0);
 
-    -- 8通道独立读地�?与偏�?
-    signal addrb0, addrb1, addrb2, addrb3, addrb4, addrb5, addrb6, addrb7 : std_logic_vector(13 downto 0);
-    signal off0, off1, off2, off3, off4, off5, off6, off7 : std_logic_vector(2 downto 0);
-    signal off0_r, off1_r, off2_r, off3_r, off4_r, off5_r, off6_r, off7_r : std_logic_vector(2 downto 0);
-    
-    signal idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7 : std_logic_vector(15 downto 0);
-    signal tx_en, tx_en_r : std_logic;
+    signal ram_wea      : std_logic_vector(0 downto 0);
+    signal ram_addra    : std_logic_vector(12 downto 0);
+    signal ram_dina     : std_logic_vector(47 downto 0);
+    signal frame_ready  : std_logic;
+    signal cnt_ram      : std_logic_vector(13 downto 0);
 
-    -- RAM 输出�? LLR 寄存�?
-    signal dout0, dout1, dout2, dout3, dout4, dout5, dout6, dout7 : std_logic_vector(47 downto 0);
-    signal llr0, llr1, llr2, llr3, llr4, llr5, llr6, llr7 : std_logic_vector(5 downto 0);
-
-    -- Q值移位预计算 (无乘法器)
-    signal q_ext : std_logic_vector(15 downto 0);
-    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7, q_x8 : std_logic_vector(15 downto 0);
-
-	------------------------------------llr_ram-------------------------------------
-	signal Blk_2N : std_logic_vector(8 downto 0); --360/180/90 
-
-	signal llr_adjust : std_logic_vector(47 downto 0);  
-	signal llr_adjust_en : std_logic;  
-	signal state : std_logic;  
-	
-	signal llr_ram_wea : std_logic_vector(0 downto 0);
-	signal llr_ram_addra : std_logic_vector(11 downto 0);
-	signal llr_ram_dina : std_logic_vector(2159 downto 0);
-	signal llr_ram_addrb : std_logic_vector(11 downto 0);
-	signal llr_ram_doutb : std_logic_vector(2159 downto 0);
-	signal llr_ram_doutb_d1, llr_ram_doutb_d2 : std_logic_vector(2159 downto 0);
-	
-	signal cnt_45 : integer range 0 to 63;
-	signal rsta_busya,rstb_busyb : std_logic;
-	signal cnt_llr : integer range 0 to 3000:= 0;
+    -- RAM Read Control Signals(Process 3)
+    signal rd_cnt       : std_logic_vector(12 downto 0);
+    signal rd_en        : std_logic;
+    signal rd_en_d1     : std_logic;
+    signal ram_addrb    : std_logic_vector(12 downto 0);
+    signal ram_doutb    : std_logic_vector(47 DOWNTO 0);
 
 begin
-	Inst_ldpc_decode_llr_ram : ldpc_decode_llr_ram_8frame
+    llr_adjust_ram : ldpc_decode_llr_adjust_ram
 	  PORT MAP (
 		 clka => i_clk,
-		 wea => llr_ram_wea,
-		 addra => llr_ram_addra,
-		 rstb => i_rst,
-		 dina => llr_ram_dina,
-		 clkb => i_clk,
-		 rsta_busy => rsta_busya,   
-         rstb_busy => rstb_busyb,
-		 addrb => llr_ram_addrb,
-		 doutb => llr_ram_doutb
+		 wea => ram_wea,
+		 addra => ram_addra,
+		 dina  => ram_dina,
+		 clkb  => i_clk,
+		 addrb => ram_addrb,
+		 doutb => ram_doutb
 	  );
 
-    -- =========================================================
-    -- 0. 高频无乘法器计算网络 (纯组合�?�辑 + 移位累加)
-    -- =========================================================
-    -- 1. 计算�?帧需要的总字�? = (Blk_N + 1) * 45
-    N_plus_1 <= ("0" & Blk_N) + 1;
-    N_p1_ext <= "000000" & N_plus_1; 
-    -- 乘以45 (32 + 8 + 4 + 1) -> 纯移位加�?
-    total_words <= (N_p1_ext(9 downto 0) & "00000") + 
-                   (N_p1_ext(11 downto 0) & "000") + 
-                   (N_p1_ext(12 downto 0) & "00") + 
-                   N_p1_ext;
-
-    -- 2. 计算 q_val = Blk_N + 1 - Blk_K
-    q_val <= ("0" & Blk_N) + 1 - ("0" & Blk_K);
-    q_ext <= "0000000" & q_val; 
-
-    -- 3. Q 的�?�数预计算表 (0DSP, 纯加�?)
-    q_x1 <= q_ext;
-    q_x2 <= q_ext(14 downto 0) & "0";
-    q_x3 <= (q_ext(14 downto 0) & "0") + q_ext;
-    q_x4 <= q_ext(13 downto 0) & "00";
-    q_x5 <= (q_ext(13 downto 0) & "00") + q_ext;
-    q_x6 <= (q_ext(13 downto 0) & "00") + (q_ext(14 downto 0) & "0");
-    q_x7 <= (q_ext(13 downto 0) & "00") + (q_ext(14 downto 0) & "0") + q_ext;
-    q_x8 <= q_ext(12 downto 0) & "000";
-
-    -- =========================================================
-    -- 1. 物理层：8 �? BRAM 副本例化
-    -- =========================================================
-    addra_full <= ping_pong_wr & rx_cnt(12 downto 0);
-    
-    RAM0 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb0, doutb => dout0);
-    RAM1 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb1, doutb => dout1);
-    RAM2 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb2, doutb => dout2);
-    RAM3 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb3, doutb => dout3);
-    RAM4 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb4, doutb => dout4);
-    RAM5 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb5, doutb => dout5);
-    RAM6 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb6, doutb => dout6);
-    RAM7 : parity_bram_48w_16384d PORT MAP(clka => i_clk, wea => wea, addra => addra_full, dina => iv_llr, clkb => i_clk, addrb => addrb7, doutb => dout7);
-
-    -- =========================================================
-    -- 2. 前台 Rx 控制：满帧接收流水线
-    -- =========================================================
-    process(i_clk)
+    -- ==================================================================
+    -- Parameter Computations 
+    -- ==================================================================
+    q_multi_calu_pro:process(i_clk)
     begin
-        if rising_edge(i_clk) then
-            if i_rst = '1' then
-                rx_cnt <= (others => '0');
-                ping_pong_wr <= '0';
-                rx_toggle <= '0';
-                wea <= "0";
+        if(i_clk'event and i_clk = '1')then
+            if (i_rst = '1') then
+                INFO_LEN  <= (others => '0');
+                q_val <=  (others => '0');
+                q_ext <=  (others => '0');
+                q_x1  <=  (others => '0'); 
+                q_x2  <=  (others => '0'); 
+                q_x3  <=  (others => '0');
+                q_x4  <=  (others => '0'); 
+                q_x5  <=  (others => '0'); 
+                q_x6  <=  (others => '0'); 
+                q_x7  <=  (others => '0');
             else
-                if i_llr_en = '1' then
-                    wea <= "1";
-                    if rx_cnt = total_words(13 downto 0) - 1 then
-                        rx_cnt <= (others => '0');
-                        finished_bank <= ping_pong_wr;     -- 记录刚写满的是哪个区
-                        ping_pong_wr <= not ping_pong_wr;  -- 前台切区
-                        rx_toggle <= not rx_toggle;        -- 敲门唤醒后台
-                    else
-                        rx_cnt <= rx_cnt + 1;
+                -- Calculate K multiplied by 45
+                -- Example: 90*45 - 1 = 4049
+                INFO_LEN <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K) - 1; 
+                
+                q_val <= ("0" & Blk_N) - ("0" & Blk_K);
+                q_ext <= "00" & q_val;
+
+                q_x1 <= q_ext;
+                q_x2 <= q_ext(9 downto 0) & "0";
+                q_x3 <= (q_ext(9 downto 0) & "0") + q_ext;
+                q_x4 <= q_ext(8 downto 0) & "00";
+                q_x5 <= (q_ext(8 downto 0) & "00") + q_ext;
+                q_x6 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0");
+                q_x7 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0") + q_ext;
+            end if;
+        end if;
+    end process;
+
+    -- ==================================================================
+    -- reg control:Rx checkbits and parity
+    -- ==================================================================
+    reg_ctrl_pro : process(i_clk)
+        variable base_wr : integer range 0 to 1119;
+    begin
+        if (i_clk'event and i_clk = '1') then
+            if (i_rst = '1') then
+                ping_reg <= (others => (others => '0'));
+                pong_reg <= (others => (others => '0'));
+                llr_in_cnt   <= (others => '0');
+                parity_q_cnt <= (others => '0');
+                parity_j_cnt <= (others => '0');
+                pp_arr_wr    <= '0';
+                tx_running   <= '0';
+                tx_j_cnt     <= (others => '0');
+            else
+
+                if (i_llr_en = '1') then
+                    -- checkbits
+                    if (llr_in_cnt > INFO_LEN) then
+                        base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
+                        if pp_arr_wr = '0' then
+                            ping_reg(base_wr+0) <= iv_llr(5 downto 0);   ping_reg(base_wr+1) <= iv_llr(11 downto 6);
+                            ping_reg(base_wr+2) <= iv_llr(17 downto 12); ping_reg(base_wr+3) <= iv_llr(23 downto 18);
+                            ping_reg(base_wr+4) <= iv_llr(29 downto 24); ping_reg(base_wr+5) <= iv_llr(35 downto 30);
+                            ping_reg(base_wr+6) <= iv_llr(41 downto 36); ping_reg(base_wr+7) <= iv_llr(47 downto 42);
+                        else
+                            pong_reg(base_wr+0) <= iv_llr(5 downto 0);   pong_reg(base_wr+1) <= iv_llr(11 downto 6);
+                            pong_reg(base_wr+2) <= iv_llr(17 downto 12); pong_reg(base_wr+3) <= iv_llr(23 downto 18);
+                            pong_reg(base_wr+4) <= iv_llr(29 downto 24); pong_reg(base_wr+5) <= iv_llr(35 downto 30);
+                            pong_reg(base_wr+6) <= iv_llr(41 downto 36); pong_reg(base_wr+7) <= iv_llr(47 downto 42);
+                        end if;
+
+                        -- parity_q_cnt:* 8(= parity_j_cnt) for ping reg/pong reg base_wr_addr
+                        -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt
+                        -- tx_j_cnt delays parity_j_cnt after one reg group wr, for ram addr accumulation(<-> reg row change)
+                        if (parity_q_cnt = q_val - 1) then
+                            parity_q_cnt <= (others => '0');
+                            tx_running <= '1';
+                            tx_arr_sel <= pp_arr_wr;
+                            tx_j_cnt   <= parity_j_cnt;
+                            
+                            pp_arr_wr <= not pp_arr_wr;
+                            
+                            if parity_j_cnt = 44 then
+                                parity_j_cnt <= (others => '0');
+                            else
+                                parity_j_cnt <= parity_j_cnt + 1;
+                            end if;
+                        else
+                            parity_q_cnt <= parity_q_cnt + 1;
+                        end if;
                     end if;
-                else
-                    wea <= "0";
+
+                    -- llr input global cnt (0 to LEN_N) for infobits write to ram &
+                    if (llr_in_cnt = LEN_N) then
+                        llr_in_cnt <= (others => '0');
+                    else
+                        llr_in_cnt <= llr_in_cnt + 1;
+                    end if;
+                end if;
+                
+                -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
+                if (tx_running = '1') and (tx_m_cnt = q_val - 1) and (tx_j_cnt = 44) then
+                    tx_running <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- ==================================================================
+    -- ram wr control: infobits directly write,checkbits read from changed reg addr and write to changed ram addr
+    -- ==================================================================
+    ram_write_pro : process(i_clk)
+    begin
+        if (i_clk'event and i_clk = '1') then
+            if (i_rst = '1') then
+                ram_wea  <= (others => '1');
+                ram_dina <= (others => '0');
+                tx_m_cnt <= (others => '0');
+                tx_m_offset <= (others => '0');
+                frame_ready <= '0';
+                if (cnt_ram = 0) then --add to clear the data in the llr_ram when i_rst = 1
+					ram_addra <= (others => '0');
+					cnt_ram <= cnt_ram + 1; 
+				elsif(cnt_ram >= 1 and cnt_ram < 8192)then
+					ram_addra <= ram_addra + 1;
+					cnt_ram <= cnt_ram + 1;
+				else
+					cnt_ram <= cnt_ram;
+					ram_addra <= (others => '0');
+				end if;	
+            else
+                ram_wea <= "0";
+                frame_ready <= '0';
+
+                -- Infobits directly write to ram(addr sequential increment)
+                if (i_llr_en = '1') and (llr_in_cnt <= INFO_LEN) then
+                    ram_wea   <= "1";
+                    ram_addra <= llr_in_cnt;
+                    ram_dina  <= iv_llr;
+                end if;
+
+                -- Reg data transpose read & write to RAM(Parity Scatter)
+                if (tx_running = '1') then
+                    ram_wea <= "1";
+                    
+                    -- Calc scatter addr: (INFO_LEN+1)=parity base addr
+                    -- tx_m_offset replaces tx_m_cnt*45 multiply,tx_m_cnt++ → RAM addr+45(360/8), reg col-wise wr
+                    -- tx_j_cnt++ → RAM addr+1, inc after full col reg wr for next group,
+                    ram_addra <= (INFO_LEN + 1) + tx_m_offset + ("0000000" & tx_j_cnt);
+
+                    -- Interleaved rd 8 LLR from reg
+                    -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
+                    -- tx_arr_sel controls ping-pong switch
+                    if (tx_arr_sel = '0') then
+                        ram_dina <= ping_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
+                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
+                                    ping_reg(conv_integer(tx_m_cnt));
+                    else
+                        ram_dina <= pong_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
+                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
+                                    pong_reg(conv_integer(tx_m_cnt));
+                    end if;
+
+                    -- FSM transition & accumulator inc
+                    if (tx_m_cnt = q_val - 1) then
+                        tx_m_cnt <= (others => '0');
+                        tx_m_offset <= (others => '0'); -- Reset accum at chunk end
+                        
+                        if (tx_j_cnt = 44) then
+                            frame_ready <= '1'; -- Full frame done, notify read proc
+                        end if;
+                    else
+                        tx_m_cnt <= tx_m_cnt + 1;
+                        tx_m_offset <= tx_m_offset + 45; -- Add 45 per cycle
+                    end if;
+                end if;
+            end if;
+        end if;
+    end process;
+    -- ==================================================================
+    -- ram rd control: Seq rd RAM addr after frame_ready assert,output llr_adjusted
+    -- ==================================================================
+    ram_read_pro : process(i_clk)
+    begin
+        if (i_clk'event and i_clk = '1') then
+            if (i_rst = '1') then
+                rd_en     <= '0';
+                rd_en_d1  <= '0';
+                rd_cnt    <= (others => '0');
+                ram_addrb <= (others => '0');
+                ov_llr    <= (others => '0');
+                o_llr_en  <= '0';
+            else
+                -- delay for ram read and out
+                rd_en_d1 <= rd_en;
+                o_llr_en <= rd_en_d1;
+
+                if (frame_ready = '1') then
+                    rd_en <= '1';
+                    rd_cnt <= (others => '0');
+                    ram_addrb <= (others => '0');
+                elsif (rd_en = '1') then
+                    if (rd_cnt < LEN_N) then
+                        rd_cnt <= rd_cnt + 1;
+                        ram_addrb <= ram_addrb + 1;
+                    else
+                        rd_en <= '0';
+                    end if;
+                end if;
+
+                if (rd_en_d1 = '1') then
+                    ov_llr <= ram_doutb;
+                else 
+                    ov_llr <= (others => '0');
                 end if;
             end if;
         end if;
     end process;
 
     -- =========================================================
-    -- 3. 后台 Tx 状�?�机 (完美规避乘法�?)
-    -- =========================================================
-    process(i_clk)
-    begin
-        if rising_edge(i_clk) then
-            if i_rst = '1' then
-                tx_state <= IDLE;
-                tx_toggle <= '0';
-                tx_en <= '0';
-                info_base_addr <= (others => '0');
-            else
-                case tx_state is
-                    when IDLE =>
-                        tx_en <= '0';
-                        info_base_addr <= (others => '0');
-                        if rx_toggle /= tx_toggle then
-                            tx_toggle <= rx_toggle;       
-                            ping_pong_rd <= finished_bank;
-                            tx_macro_row <= (others => '0');
-                            tx_state <= TX_INFO_PREP;
-                        end if;
-
-                    -- 【阶段A】信息位输出
-                    when TX_INFO_PREP =>
-                        if tx_macro_row = Blk_K then
-                            m_cnt <= (others => '0');
-                            tx_state <= TX_PARITY_PREP;
-                        else
-                            seq_addr <= info_base_addr; -- 直接使用累加器基�?
-                            j_cnt <= (others => '0');
-                            tx_state <= TX_INFO_RUN;
-                        end if;
-
-                    when TX_INFO_RUN =>
-                        addrb0 <= ping_pong_rd & seq_addr; addrb1 <= ping_pong_rd & seq_addr;
-                        addrb2 <= ping_pong_rd & seq_addr; addrb3 <= ping_pong_rd & seq_addr;
-                        addrb4 <= ping_pong_rd & seq_addr; addrb5 <= ping_pong_rd & seq_addr;
-                        addrb6 <= ping_pong_rd & seq_addr; addrb7 <= ping_pong_rd & seq_addr;
-                        
-                        off0 <= "000"; off1 <= "001"; off2 <= "010"; off3 <= "011";
-                        off4 <= "100"; off5 <= "101"; off6 <= "110"; off7 <= "111";
-                        
-                        seq_addr <= seq_addr + 1;
-                        tx_en <= '1';
-                        
-                        if j_cnt = "101100" then -- 44
-                            tx_state <= TX_INFO_WAIT;
-                        else
-                            j_cnt <= j_cnt + 1;
-                        end if;
-
-                    when TX_INFO_WAIT =>
-                        tx_en <= '0';
-                        tx_macro_row <= tx_macro_row + 1;
-                        -- 核心优化：每次结束一个宏行，基址�?45�?(省去乘法)
-                        info_base_addr <= info_base_addr + "0000000101101"; 
-                        tx_state <= TX_INFO_PREP;
-
-                    -- 【阶段B】校验位交织输出
-                    when TX_PARITY_PREP =>
-                        idx0 <= "0000000" & m_cnt;
-                        idx1 <= ("0000000" & m_cnt) + q_x1;
-                        idx2 <= ("0000000" & m_cnt) + q_x2;
-                        idx3 <= ("0000000" & m_cnt) + q_x3;
-                        idx4 <= ("0000000" & m_cnt) + q_x4;
-                        idx5 <= ("0000000" & m_cnt) + q_x5;
-                        idx6 <= ("0000000" & m_cnt) + q_x6;
-                        idx7 <= ("0000000" & m_cnt) + q_x7;
-                        
-                        j_cnt <= (others => '0');
-                        tx_state <= TX_PARITY_RUN;
-
-                    when TX_PARITY_RUN =>
-                        -- 核心优化：parity_base 其实就是 info_base_addr，因为它已经累加�? Blk_K*45 了！
-                        addrb0 <= ping_pong_rd & (info_base_addr + idx0(15 downto 3)); off0 <= idx0(2 downto 0);
-                        addrb1 <= ping_pong_rd & (info_base_addr + idx1(15 downto 3)); off1 <= idx1(2 downto 0);
-                        addrb2 <= ping_pong_rd & (info_base_addr + idx2(15 downto 3)); off2 <= idx2(2 downto 0);
-                        addrb3 <= ping_pong_rd & (info_base_addr + idx3(15 downto 3)); off3 <= idx3(2 downto 0);
-                        addrb4 <= ping_pong_rd & (info_base_addr + idx4(15 downto 3)); off4 <= idx4(2 downto 0);
-                        addrb5 <= ping_pong_rd & (info_base_addr + idx5(15 downto 3)); off5 <= idx5(2 downto 0);
-                        addrb6 <= ping_pong_rd & (info_base_addr + idx6(15 downto 3)); off6 <= idx6(2 downto 0);
-                        addrb7 <= ping_pong_rd & (info_base_addr + idx7(15 downto 3)); off7 <= idx7(2 downto 0);
-                        
-                        idx0 <= idx0 + q_x8; idx1 <= idx1 + q_x8; idx2 <= idx2 + q_x8; idx3 <= idx3 + q_x8;
-                        idx4 <= idx4 + q_x8; idx5 <= idx5 + q_x8; idx6 <= idx6 + q_x8; idx7 <= idx7 + q_x8;
-
-                        tx_en <= '1';
-                        if j_cnt = "101100" then -- 44
-                            tx_state <= TX_PARITY_WAIT;
-                        else
-                            j_cnt <= j_cnt + 1;
-                        end if;
-
-                    when TX_PARITY_WAIT =>
-                        tx_en <= '0';
-                        if m_cnt = q_val - 1 then
-                            tx_state <= IDLE; 
-                        else
-                            m_cnt <= m_cnt + 1;
-                            tx_state <= TX_PARITY_PREP;
-                        end if;
-
-                end case;
-            end if;
-        end if;
-    end process;
-
-    -- =========================================================
-    -- 4. 纯组合�?�辑 MUX 提取�? (替代 conv_integer �? array)
-    -- =========================================================
-    mux_extract : process(off0_r, off1_r, off2_r, off3_r, off4_r, off5_r, off6_r, off7_r, 
-                          dout0, dout1, dout2, dout3, dout4, dout5, dout6, dout7)
-    begin
-        case off0_r is
-            when "000" => llr0 <= dout0(5 downto 0);   when "001" => llr0 <= dout0(11 downto 6);
-            when "010" => llr0 <= dout0(17 downto 12); when "011" => llr0 <= dout0(23 downto 18);
-            when "100" => llr0 <= dout0(29 downto 24); when "101" => llr0 <= dout0(35 downto 30);
-            when "110" => llr0 <= dout0(41 downto 36); when "111" => llr0 <= dout0(47 downto 42);
-            when others => llr0 <= (others => '0');
-        end case;
-
-        case off1_r is
-            when "000" => llr1 <= dout1(5 downto 0);   when "001" => llr1 <= dout1(11 downto 6);
-            when "010" => llr1 <= dout1(17 downto 12); when "011" => llr1 <= dout1(23 downto 18);
-            when "100" => llr1 <= dout1(29 downto 24); when "101" => llr1 <= dout1(35 downto 30);
-            when "110" => llr1 <= dout1(41 downto 36); when "111" => llr1 <= dout1(47 downto 42);
-            when others => llr1 <= (others => '0');
-        end case;
-
-        case off2_r is
-            when "000" => llr2 <= dout2(5 downto 0);   when "001" => llr2 <= dout2(11 downto 6);
-            when "010" => llr2 <= dout2(17 downto 12); when "011" => llr2 <= dout2(23 downto 18);
-            when "100" => llr2 <= dout2(29 downto 24); when "101" => llr2 <= dout2(35 downto 30);
-            when "110" => llr2 <= dout2(41 downto 36); when "111" => llr2 <= dout2(47 downto 42);
-            when others => llr2 <= (others => '0');
-        end case;
-
-        case off3_r is
-            when "000" => llr3 <= dout3(5 downto 0);   when "001" => llr3 <= dout3(11 downto 6);
-            when "010" => llr3 <= dout3(17 downto 12); when "011" => llr3 <= dout3(23 downto 18);
-            when "100" => llr3 <= dout3(29 downto 24); when "101" => llr3 <= dout3(35 downto 30);
-            when "110" => llr3 <= dout3(41 downto 36); when "111" => llr3 <= dout3(47 downto 42);
-            when others => llr3 <= (others => '0');
-        end case;
-
-        case off4_r is
-            when "000" => llr4 <= dout4(5 downto 0);   when "001" => llr4 <= dout4(11 downto 6);
-            when "010" => llr4 <= dout4(17 downto 12); when "011" => llr4 <= dout4(23 downto 18);
-            when "100" => llr4 <= dout4(29 downto 24); when "101" => llr4 <= dout4(35 downto 30);
-            when "110" => llr4 <= dout4(41 downto 36); when "111" => llr4 <= dout4(47 downto 42);
-            when others => llr4 <= (others => '0');
-        end case;
-
-        case off5_r is
-            when "000" => llr5 <= dout5(5 downto 0);   when "001" => llr5 <= dout5(11 downto 6);
-            when "010" => llr5 <= dout5(17 downto 12); when "011" => llr5 <= dout5(23 downto 18);
-            when "100" => llr5 <= dout5(29 downto 24); when "101" => llr5 <= dout5(35 downto 30);
-            when "110" => llr5 <= dout5(41 downto 36); when "111" => llr5 <= dout5(47 downto 42);
-            when others => llr5 <= (others => '0');
-        end case;
-
-        case off6_r is
-            when "000" => llr6 <= dout6(5 downto 0);   when "001" => llr6 <= dout6(11 downto 6);
-            when "010" => llr6 <= dout6(17 downto 12); when "011" => llr6 <= dout6(23 downto 18);
-            when "100" => llr6 <= dout6(29 downto 24); when "101" => llr6 <= dout6(35 downto 30);
-            when "110" => llr6 <= dout6(41 downto 36); when "111" => llr6 <= dout6(47 downto 42);
-            when others => llr6 <= (others => '0');
-        end case;
-
-        case off7_r is
-            when "000" => llr7 <= dout7(5 downto 0);   when "001" => llr7 <= dout7(11 downto 6);
-            when "010" => llr7 <= dout7(17 downto 12); when "011" => llr7 <= dout7(23 downto 18);
-            when "100" => llr7 <= dout7(29 downto 24); when "101" => llr7 <= dout7(35 downto 30);
-            when "110" => llr7 <= dout7(41 downto 36); when "111" => llr7 <= dout7(47 downto 42);
-            when others => llr7 <= (others => '0');
-        end case;
-    end process;
-
-    -- =========================================================
-    -- 5. 管道对齐与最终输�? 
-    -- =========================================================
-    process(i_clk)
-    begin
-        if rising_edge(i_clk) then
-            tx_en_r <= tx_en;
-            off0_r <= off0; off1_r <= off1; off2_r <= off2; off3_r <= off3;
-            off4_r <= off4; off5_r <= off5; off6_r <= off6; off7_r <= off7;
-            
-            if i_rst = '1' then
-                ov_llr <= (others => '0');
-                o_llr_en <= '0';
-				llr_adjust <= (others => '0');
-				llr_adjust_en <= '0';
-            else
-                o_llr_en <= tx_en_r;
-				llr_adjust_en <= tx_en_r;
-                if tx_en_r = '1' then
-                    ov_llr <= llr7 & llr6 & llr5 & llr4 & llr3 & llr2 & llr1 & llr0;
-					llr_adjust <= llr7 & llr6 & llr5 & llr4 & llr3 & llr2 & llr1 & llr0;
-				end if;
-            end if;
-        end if;
-    end process;
-
-    -- =========================================================
-    -- 6. DVB-S2 参数查表解析 (保持原版设计)
+    -- DVB-S2 Parameter Process (Omitted for brevity, use existing)
     -- =========================================================
     ldpc_parameter : process(i_clk)
 	begin
 		if(i_clk'event and i_clk = '1')then
 			if(i_rst = '1')then
 				Blk_K <= (others => '0');				
-				Blk_N <= (others => '0');								
+				Blk_N <= (others => '0');			
+				LEN_N <= (others => '0');				
 				ov_blk_k <= (others => '0');				
-				ov_blk_n <= (others => '0');				
+				ov_blk_n <= (others => '1');				
 			else
-			
+				-- if (i_llr_start = '1') then
 				if(iv_len = "00")then
-					Blk_N <= "10110011";--179
+					Blk_N <= "10110100";--180
+					LEN_N <= "1111110100011";--8099
 					case iv_rate is
 					--DVB-S2X
 						when "000000" => Blk_K <= conv_std_logic_vector(40,8);--2/9
@@ -490,7 +394,8 @@ begin
 						when others => Blk_K <= (others => '0');
 					end case;
 				elsif(iv_len = "01")then
-					Blk_N <= "01011001";--89
+					Blk_N <= "01011010";--90
+					LEN_N <= "0111111010001";--4049
 					case iv_rate is
 						when "000000" => Blk_K <= conv_std_logic_vector(18,8);--1/5
 						when "000001" => Blk_K <= conv_std_logic_vector(22,8);--11/45
@@ -498,7 +403,8 @@ begin
 						when others => Blk_K <= (others => '0');
 					end case;
 				else
-					Blk_N <= "00101100";--44
+					Blk_N <= "00101101";--45
+					LEN_N <= "0011111101000";--2024
 					case iv_rate is
 						when "000000" => Blk_K <= conv_std_logic_vector(11,8);--11/45
 						when "000001" => Blk_K <= conv_std_logic_vector(12,8);--4/15
@@ -526,65 +432,7 @@ begin
 				ov_blk_n <= Blk_N;
 			end if;
 		end if;
-	end process;
-
-	-------------------------------------llr_ram_pro--------------------------------------------
-	llr_ram_input_ctrl : process(i_clk)
-		variable rows_per_frame : std_logic_vector(11 downto 0); -- num of 2160bits(360 llr) per frame:normal-180/medium-90/short-45=Blk_N+1
-        variable total_rows_8f  : std_logic_vector(11 downto 0); -- num of 2160bits(360 llr) per 8 frame(one cycle) for ping-ram finish:(Blk_N+1) * 8;
-        variable total_rows_16f : std_logic_vector(11 downto 0); -- num of 2160bits(360 llr) per 16 frame for pong-ram finish:(Blk_N+1) * 16;
-	begin
-		if(i_clk'event and i_clk = '1')then
-			if(i_rst = '1')then
-				llr_ram_wea <= (others => '1');
-				llr_ram_dina <= (others => '0');
-				cnt_45 <= 0;
-				state <= '0';
-				if cnt_llr = 0 then --add to clear the data in the llr_ram when i_rst = 1
-					llr_ram_addra <= (others => '0');
-					cnt_llr <= cnt_llr + 1; 
-				elsif(cnt_llr >= 1 and cnt_llr < 10)then -- testbench:10,actual:2884
-					llr_ram_addra <= llr_ram_addra + 1;
-					cnt_llr <= cnt_llr + 1;
-				else
-					cnt_llr <= cnt_llr;
-					llr_ram_addra <= (others => '0');
-				end if;	
-			else				
-				cnt_llr <= 0;
-				rows_per_frame := "000" & (("0" & Blk_N) + 1);         -- Blk_N+1
-                total_rows_8f  := rows_per_frame(8 downto 0) & "000";  -- (Blk_N+1)*8
-                total_rows_16f := rows_per_frame(7 downto 0) & "0000"; -- ((Blk_N+1)*8)*2
-				if(llr_adjust_en = '1')then
-					if(cnt_45 = 44)then
-						cnt_45 <= 0;
-						llr_ram_wea <= "1";
-						llr_ram_addra <= llr_ram_addra + '1';
-					else
-						cnt_45 <= cnt_45 + 1;
-						llr_ram_wea <= "0";
-						llr_ram_addra <= llr_ram_addra;
-					end if;
-				else
-					cnt_45 <= 0;
-					llr_ram_wea <= (others => '0');
-					-- after a frame data write finish,change write addr and read state
-					if(llr_ram_addra = total_rows_16f)and(llr_ram_wea = "1")then
-						llr_ram_addra <= (others => '0');
-						state <= not state; -- 1->0
-					elsif(llr_ram_addra = total_rows_8f)and(llr_ram_wea = "1")then
-						llr_ram_addra <= llr_ram_addra;
-						state <= not state; -- 0->1
-					else
-						llr_ram_addra <= llr_ram_addra;
-						state <= state;
-					end if;
-				end if;
-				
-				
-				llr_ram_dina(48*cnt_45+47 downto 48*cnt_45) <= llr_adjust;--serial to parallel
-			end if;
-		end if;
-	end process;
+		-- end if;
+    end process;
 
 end Behavioral;
