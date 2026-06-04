@@ -36,13 +36,16 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     -- info bits wr directly,check bits register-adjusted then wr to matching addr
     COMPONENT ldpc_decode_llr_adjust_ram
       PORT (
-        clka  : IN STD_LOGIC;
-        wea   : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
-        addra : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
-        dina  : IN STD_LOGIC_VECTOR(47 DOWNTO 0); -- 8-ch input
-        clkb  : IN STD_LOGIC;
-        addrb : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
-        doutb : OUT STD_LOGIC_VECTOR(47 DOWNTO 0) -- 8-ch adjusted output
+        clka      : IN STD_LOGIC;
+        wea       : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
+        addra     : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
+        dina      : IN STD_LOGIC_VECTOR(47 DOWNTO 0); -- 8-ch input
+        rstb      : IN STD_LOGIC;
+        clkb      : IN STD_LOGIC;
+        rsta_busy : OUT STD_LOGIC;
+        rstb_busy : OUT STD_LOGIC;
+        addrb     : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
+        doutb     : OUT STD_LOGIC_VECTOR(47 DOWNTO 0) -- 8-ch adjusted output
       );
     END COMPONENT;
 
@@ -87,25 +90,29 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal ram_addra    : std_logic_vector(12 downto 0);
     signal ram_dina     : std_logic_vector(47 downto 0);
     signal frame_ready  : std_logic;
-    signal cnt_ram      : std_logic_vector(13 downto 0);
 
     -- RAM Read Control Signals(Process 3)
     signal rd_cnt       : std_logic_vector(12 downto 0);
     signal rd_en        : std_logic;
-    signal rd_en_d1     : std_logic;
     signal ram_addrb    : std_logic_vector(12 downto 0);
     signal ram_doutb    : std_logic_vector(47 DOWNTO 0);
+    signal rsta_busy,rstb_busy : std_logic;
+    signal rd_en_d1,rd_en_d2   : std_logic;
+    
 
 begin
     llr_adjust_ram : ldpc_decode_llr_adjust_ram
 	  PORT MAP (
-		 clka => i_clk,
-		 wea => ram_wea,
-		 addra => ram_addra,
-		 dina  => ram_dina,
-		 clkb  => i_clk,
-		 addrb => ram_addrb,
-		 doutb => ram_doutb
+		 clka      => i_clk,
+		 wea       => ram_wea,
+		 addra     => ram_addra,
+		 dina      => ram_dina,
+		 rstb      => i_rst,
+		 clkb      => i_clk,      
+		 rsta_busy => rsta_busy,      
+         rstb_busy => rstb_busy,
+		 addrb     => ram_addrb,
+		 doutb     => ram_doutb
 	  );
 
     -- ==================================================================
@@ -159,8 +166,13 @@ begin
                 parity_j_cnt <= (others => '0');
                 pp_arr_wr    <= '0';
                 tx_running   <= '0';
+                tx_arr_sel   <= '0';
                 tx_j_cnt     <= (others => '0');
             else
+                -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
+                if (tx_running = '1') and (tx_m_cnt = q_val - 1)then
+                    tx_running <= '0';
+                end if;
 
                 if (i_llr_en = '1') then
                     -- checkbits
@@ -206,11 +218,6 @@ begin
                         llr_in_cnt <= llr_in_cnt + 1;
                     end if;
                 end if;
-                
-                -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
-                if (tx_running = '1') and (tx_m_cnt = q_val - 1) and (tx_j_cnt = 44) then
-                    tx_running <= '0';
-                end if;
             end if;
         end if;
     end process;
@@ -222,21 +229,10 @@ begin
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                ram_wea  <= (others => '1');
-                ram_dina <= (others => '0');
+                ram_wea  <= (others => '0');
                 tx_m_cnt <= (others => '0');
                 tx_m_offset <= (others => '0');
-                frame_ready <= '0';
-                if (cnt_ram = 0) then --add to clear the data in the llr_ram when i_rst = 1
-					ram_addra <= (others => '0');
-					cnt_ram <= cnt_ram + 1; 
-				elsif(cnt_ram >= 1 and cnt_ram < 8192)then
-					ram_addra <= ram_addra + 1;
-					cnt_ram <= cnt_ram + 1;
-				else
-					cnt_ram <= cnt_ram;
-					ram_addra <= (others => '0');
-				end if;	
+                frame_ready <= '0';	
             else
                 ram_wea <= "0";
                 frame_ready <= '0';
@@ -305,6 +301,7 @@ begin
             if (i_rst = '1') then
                 rd_en     <= '0';
                 rd_en_d1  <= '0';
+                rd_en_d2  <= '0';
                 rd_cnt    <= (others => '0');
                 ram_addrb <= (others => '0');
                 ov_llr    <= (others => '0');
@@ -312,7 +309,8 @@ begin
             else
                 -- delay for ram read and out
                 rd_en_d1 <= rd_en;
-                o_llr_en <= rd_en_d1;
+                rd_en_d2 <= rd_en_d1;
+                o_llr_en <= rd_en_d2;
 
                 if (frame_ready = '1') then
                     rd_en <= '1';
@@ -327,9 +325,9 @@ begin
                     end if;
                 end if;
 
-                if (rd_en_d1 = '1') then
+                if (rd_en_d2 = '1') then
                     ov_llr <= ram_doutb;
-                else 
+                else
                     ov_llr <= (others => '0');
                 end if;
             end if;
