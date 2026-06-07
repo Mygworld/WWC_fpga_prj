@@ -10,7 +10,6 @@
 -- Tool versions: 
 -- Description:    DVB-S2/S2X LLR Interleaver utilizing 1D Ping-Pong Register Array
 --                 to perform 48-bit to 48-bit Matrix Transposition.
--- Revision 0.02 - 
 ----------------------------------------------------------------------------------
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
@@ -21,12 +20,12 @@ entity ldpc_decode_llr_adjust is
     Port ( i_clk    : in  STD_LOGIC;
            i_rst    : in  STD_LOGIC;
            iv_len   : in  STD_LOGIC_VECTOR (1 downto 0);     -- normal/medium/short
-           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     -- 24 + 3 + 7(zai na ge mokuai zhuanhuan)
-           iv_llr   : in  STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch L(pi) input
+           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     -- 24 + 3 + 7
+           iv_llr   : in  STD_LOGIC_VECTOR (47 downto 0);    -- 8-channel L(pi) input
            i_llr_en : in  STD_LOGIC;
            ov_blk_k : out STD_LOGIC_VECTOR (7 downto 0);  
            ov_blk_n : out STD_LOGIC_VECTOR (7 downto 0);  
-           ov_llr   : out STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch adjusted out 
+           ov_llr   : out STD_LOGIC_VECTOR (47 downto 0);    -- 8-channel adjusted out 
            o_llr_en : out STD_LOGIC);
 end ldpc_decode_llr_adjust;
 
@@ -50,9 +49,6 @@ architecture Behavioral of ldpc_decode_llr_adjust is
       );
     END COMPONENT;
 
-    -- I/O buffer reg
-    signal llr_d1   : std_logic_vector(47 downto 0);
-    signal llr_en_d1 : std_logic;
     --------------------------------------------------------------------
     -- DVB-S2/S2X Parameters
     --------------------------------------------------------------------
@@ -63,16 +59,21 @@ architecture Behavioral of ldpc_decode_llr_adjust is
 
     -- Q Multiplier Pre-calculation (Pure Combinational)
     signal q_val : std_logic_vector(8 downto 0);
-    signal q_ext : std_logic_vector(10 downto 0);
-    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*7=980(10bits)
 
     --------------------------------------------------------------------
-    -- 1D Ping-Pong Register Array Definition (1088 depth * 6-bit For Parity Chunk Transpose)
+    -- 2D Ping-Pong Register Bank Definition (8 Banks * 140 depth * 6-bit,q_max:140)
     --------------------------------------------------------------------
-    -- 140 (max q) * 8 = 1120. We use 1120 for 8-byte alignment.
-    type reg_arr_t is array(0 to 1119) of std_logic_vector(5 downto 0);
-    signal ping_reg : reg_arr_t := (others => (others => '0'));
-    signal pong_reg : reg_arr_t := (others => (others => '0'));
+    -- 定义一个 140 深度的子数组
+    type sub_arr_t is array(0 to 139) of std_logic_vector(5 downto 0);
+    -- 定义包含 8 个子数组的 Bank 阵列
+    type bank_arr_t is array(0 to 7) of sub_arr_t;
+    
+    signal ping_bank : bank_arr_t;
+    signal pong_bank : bank_arr_t;
+
+    -- 维持当前写入位置的状态信号
+    signal wr_arr_idx  : integer range 0 to 7 := 0;
+    signal wr_loc_addr : integer range 0 to 255 := 0;
 
     --------------------------------------------------------------------
     -- Control Signals
@@ -127,34 +128,13 @@ begin
         if(i_clk'event and i_clk = '1')then
             if (i_rst = '1') then
                 INFO_LEN  <= (others => '0');
-                llr_d1    <= (others => '0');     -- I/O Input Pipelineing
-                llr_en_d1 <= '0';
                 q_val <=  (others => '0');
-                q_ext <=  (others => '0');
-                q_x1  <=  (others => '0'); 
-                q_x2  <=  (others => '0'); 
-                q_x3  <=  (others => '0');
-                q_x4  <=  (others => '0'); 
-                q_x5  <=  (others => '0'); 
-                q_x6  <=  (others => '0'); 
-                q_x7  <=  (others => '0');
             else
                 -- Calculate K multiplied by 45
                 -- Example: 90*45 - 1 = 4049
-                INFO_LEN  <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K) - 1; 
-                llr_d1    <= iv_llr;
-                llr_en_d1 <= i_llr_en;
-
+                INFO_LEN <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K) - 1; 
+                
                 q_val <= ("0" & Blk_N) - ("0" & Blk_K);
-                q_ext <= "00" & q_val;
-
-                q_x1 <= q_ext;
-                q_x2 <= q_ext(9 downto 0) & "0";
-                q_x3 <= (q_ext(9 downto 0) & "0") + q_ext;
-                q_x4 <= q_ext(8 downto 0) & "00";
-                q_x5 <= (q_ext(8 downto 0) & "00") + q_ext;
-                q_x6 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0");
-                q_x7 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0") + q_ext;
             end if;
         end if;
     end process;
@@ -163,12 +143,19 @@ begin
     -- reg control:Rx checkbits and parity
     -- ==================================================================
     reg_ctrl_pro : process(i_clk)
-        variable base_wr : integer range 0 to 1119;
+        -- 局部变量用于并行计算，不跨拍
+        variable v_q_val       : integer range 0 to 511;
+        variable v_temp_addr   : integer range 0 to 511;
+        variable v_target_bank : integer range 0 to 15;
+        variable v_target_loc  : integer range 0 to 255;
+        variable v_next_addr   : integer range 0 to 511;
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                ping_reg <= (others => (others => '0'));
-                pong_reg <= (others => (others => '0'));
+                ping_bank <= (others => (others => (others => '0')));
+                pong_bank <= (others => (others => (others => '0')));
+                wr_arr_idx   <= 0;
+                wr_loc_addr  <= 0;
                 llr_in_cnt   <= (others => '0');
                 parity_q_cnt <= (others => '0');
                 parity_j_cnt <= (others => '0');
@@ -178,38 +165,79 @@ begin
                 tx_j_cnt     <= (others => '0');
             else
                 -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
-                if (llr_en_d1 = '1') and (llr_in_cnt > INFO_LEN) and (parity_q_cnt = q_val - 1) then
+                -- 【优化点 1】: 将 tx_running 的置1和清0整合进一个独立的、互斥的 if-elsif 结构中。
+                -- 先判断置1（优先级高，防止被同时到达的清0条件覆盖），再判断清0。
+                if (i_llr_en = '1') and (llr_in_cnt > INFO_LEN) and (parity_q_cnt = q_val - 1) then
                     tx_running <= '1';
                 elsif (tx_running = '1' and tx_m_cnt = q_val - 1) then
                     tx_running <= '0';
                 end if;
 
-                if (llr_en_d1 = '1') then
+                if (i_llr_en = '1') then
                     -- checkbits
                     if (llr_in_cnt > INFO_LEN) then
-                        base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
-                        if pp_arr_wr = '0' then
-                            ping_reg(base_wr+0) <= llr_d1(5 downto 0);   ping_reg(base_wr+1) <= llr_d1(11 downto 6);
-                            ping_reg(base_wr+2) <= llr_d1(17 downto 12); ping_reg(base_wr+3) <= llr_d1(23 downto 18);
-                            ping_reg(base_wr+4) <= llr_d1(29 downto 24); ping_reg(base_wr+5) <= llr_d1(35 downto 30);
-                            ping_reg(base_wr+6) <= llr_d1(41 downto 36); ping_reg(base_wr+7) <= llr_d1(47 downto 42);
-                        else
-                            pong_reg(base_wr+0) <= llr_d1(5 downto 0);   pong_reg(base_wr+1) <= llr_d1(11 downto 6);
-                            pong_reg(base_wr+2) <= llr_d1(17 downto 12); pong_reg(base_wr+3) <= llr_d1(23 downto 18);
-                            pong_reg(base_wr+4) <= llr_d1(29 downto 24); pong_reg(base_wr+5) <= llr_d1(35 downto 30);
-                            pong_reg(base_wr+6) <= llr_d1(41 downto 36); pong_reg(base_wr+7) <= llr_d1(47 downto 42);
-                        end if;
+                        -- 为了方便数学运算，将 std_logic_vector 转换为 integer
+                        v_q_val := conv_integer(q_val);
+                        
+                        -- =========================================================
+                        -- 第一部分：并行数据分发（8条路同时算，没有任何依赖）
+                        -- =========================================================
+                        for i in 0 to 7 loop
+                            -- 每一个数据独立计算它距离起点的绝对偏移
+                            v_temp_addr := wr_loc_addr + i;
 
-                        -- parity_q_cnt:* 8 for ping reg/pong reg base_wr_addr
+                            if v_temp_addr < v_q_val then
+                                -- 情况 A：没有越界，落在当前 Bank
+                                v_target_bank := wr_arr_idx;
+                                v_target_loc  := v_temp_addr;
+                                
+                            elsif v_temp_addr < (v_q_val * 2) then
+                                -- 情况 B：越过了 1 次边界，落在下一个 Bank
+                                -- 直接在分支内处理环形折叠，保证绝对互斥
+                                if (wr_arr_idx + 1 >= 8) then
+                                    v_target_bank := wr_arr_idx + 1 - 8;
+                                else
+                                    v_target_bank := wr_arr_idx + 1;
+                                end if;
+                                v_target_loc  := v_temp_addr - v_q_val;
+                                
+                            else
+                                -- 情况 C：越过了 2 次边界（仅在 q=5,6,7 时可能发生）
+                                if (wr_arr_idx + 2 >= 8) then
+                                    v_target_bank := wr_arr_idx + 2 - 8;
+                                else
+                                    v_target_bank := wr_arr_idx + 2;
+                                end if;
+                                v_target_loc  := v_temp_addr - (v_q_val * 2);
+                            end if;
+
+                            -- 并发写入 D 触发器物理阵列
+                            if pp_arr_wr = '0' then
+                                ping_bank(v_target_bank)(v_target_loc) <= iv_llr(i*6+5 downto i*6);
+                            else
+                                pong_bank(v_target_bank)(v_target_loc) <= iv_llr(i*6+5 downto i*6);
+                            end if;
+                        end loop;
+
+                        -- parity_q_cnt:* 8(= parity_j_cnt) for ping reg/pong reg base_wr_addr
                         -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt
                         -- tx_j_cnt delays parity_j_cnt after one reg group wr, for ram addr accumulation(<-> reg row change)
+                        -- =========================================================
+                        -- 第二部分：状态机与下拍指针更新（全局提前判断 +8）
+                        -- =========================================================
+                        v_next_addr := wr_loc_addr + 8;
+
                         if (parity_q_cnt = q_val - 1) then
+                            -- Chunk 刚好填满结束，各种计数器复位
                             parity_q_cnt <= (others => '0');
-                            tx_arr_sel <= pp_arr_wr;
-                            tx_j_cnt   <= parity_j_cnt;
+                            tx_arr_sel   <= pp_arr_wr;
+                            tx_j_cnt     <= parity_j_cnt;
+                            pp_arr_wr    <= not pp_arr_wr;
                             
-                            pp_arr_wr <= not pp_arr_wr;
-                            
+                            -- 阵列写满，指针硬复位，准备下一轮
+                            wr_arr_idx   <= 0;
+                            wr_loc_addr  <= 0;
+
                             if parity_j_cnt = 44 then
                                 parity_j_cnt <= (others => '0');
                             else
@@ -217,6 +245,28 @@ begin
                             end if;
                         else
                             parity_q_cnt <= parity_q_cnt + 1;
+
+                            -- 未满，根据提前算出的 v_next_addr 更新下一拍的起点
+                            if v_next_addr < v_q_val then
+                                wr_arr_idx  <= wr_arr_idx;
+                                wr_loc_addr <= v_next_addr;
+                                
+                            elsif v_next_addr < (v_q_val * 2) then
+                                if wr_arr_idx + 1 >= 8 then
+                                    wr_arr_idx <= wr_arr_idx + 1 - 8;
+                                else
+                                    wr_arr_idx <= wr_arr_idx + 1;
+                                end if;
+                                wr_loc_addr <= v_next_addr - v_q_val;
+                                
+                            else
+                                if wr_arr_idx + 2 >= 8 then
+                                    wr_arr_idx <= wr_arr_idx + 2 - 8;
+                                else
+                                    wr_arr_idx <= wr_arr_idx + 2;
+                                end if;
+                                wr_loc_addr <= v_next_addr - (v_q_val * 2);
+                            end if;
                         end if;
                     end if;
 
@@ -243,7 +293,14 @@ begin
                 tx_m_offset <= (others => '0');
                 frame_ready <= '0';	
             else
-                -- ram write finish flag for ram rd
+                -- 【优化点 2】: 取消所有开头的默认赋值，利用唯一的 if-elsif-else 互斥树控制 ram_wea, ram_addra 等。
+
+--                -- Infobits directly write to ram(addr sequential increment)
+--                if (i_llr_en = '1') and (llr_in_cnt <= INFO_LEN) then
+--                    ram_wea   <= "1";
+--                    ram_addra <= llr_in_cnt;
+--                    ram_dina  <= iv_llr;
+--                end if;
                 if (tx_running = '1') and (tx_m_cnt = q_val - 1) and (tx_j_cnt = 44) then
                     frame_ready <= '1';
                 else
@@ -262,24 +319,28 @@ begin
                     -- Interleaved rd 8 LLR from reg
                     -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
                     -- tx_arr_sel controls ping-pong switch
+                    -- ================================================
+                    -- 读逻辑降维打击：全部统一使用 tx_m_cnt 寻址
+                    -- 消灭了所有的 q_x 加法树和巨型 MUX！
+                    -- ================================================
                     if (tx_arr_sel = '0') then
-                        ram_dina <= ping_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
-                                    ping_reg(conv_integer(tx_m_cnt));
+                        ram_dina <= ping_bank(7)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(6)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(5)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(4)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(3)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(2)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(1)(conv_integer(tx_m_cnt)) & 
+                                    ping_bank(0)(conv_integer(tx_m_cnt));
                     else
-                        ram_dina <= pong_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
-                                    pong_reg(conv_integer(tx_m_cnt));
+                        ram_dina <= pong_bank(7)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(6)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(5)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(4)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(3)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(2)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(1)(conv_integer(tx_m_cnt)) & 
+                                    pong_bank(0)(conv_integer(tx_m_cnt));
                     end if;
 
                     -- FSM transition & accumulator inc
@@ -290,14 +351,18 @@ begin
                         tx_m_cnt <= tx_m_cnt + 1;
                         tx_m_offset <= tx_m_offset + 45; -- Add 45 per cycle
                     end if;
-
-                -- Infobits directly write to ram(addr sequential increment)
-                elsif (llr_en_d1 = '1' and llr_in_cnt <= INFO_LEN) then
+                    
+                -- 分支 2: 处理信息位直通（前台进程）
+                elsif (i_llr_en = '1') and (llr_in_cnt <= INFO_LEN) then
                     ram_wea     <= "1";
                     ram_addra   <= llr_in_cnt;
-                    ram_dina    <= llr_d1;
+                    ram_dina    <= iv_llr;
+                    -- tx_m_cnt / tx_m_offset 保持历史值
+
+                -- 分支 3: 空闲状态
                 else
                     ram_wea     <= "0";
+                    -- 保持 ram_addra / ram_dina / tx_m_cnt 等信号的原状态不变以节约翻转功耗
                 end if;
             end if;
         end if;
@@ -315,9 +380,7 @@ begin
                 rd_cnt    <= (others => '0');
                 ram_addrb <= (others => '0');
                 ov_llr    <= (others => '0');
-                o_llr_en  <= '0';		
-				ov_blk_k  <= (others => '0');				
-				ov_blk_n  <= (others => '1');
+                o_llr_en  <= '0';
             else
                 -- delay for ram read and out
                 rd_en_d1 <= rd_en;
@@ -339,8 +402,6 @@ begin
 
                 if (rd_en_d2 = '1') then
                     ov_llr <= ram_doutb;
-				    ov_blk_k <= Blk_K;
-				    ov_blk_n <= Blk_N;
                 else
                     ov_llr <= (others => '0');
                 end if;
@@ -358,6 +419,8 @@ begin
 				Blk_K <= (others => '0');				
 				Blk_N <= (others => '0');			
 				LEN_N <= (others => '0');				
+				ov_blk_k <= (others => '0');				
+				ov_blk_n <= (others => '1');				
 			else
 				-- if (i_llr_start = '1') then
 				if(iv_len = "00")then
@@ -437,6 +500,9 @@ begin
 						when others => Blk_K <= (others => '0');
 					end case;		
 				end if;
+				
+				ov_blk_k <= Blk_K;
+				ov_blk_n <= Blk_N;
 			end if;
 		end if;
 		-- end if;
