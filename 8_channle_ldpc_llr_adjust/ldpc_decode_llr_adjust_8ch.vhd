@@ -67,7 +67,7 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*7=980(10bits)
 
     --------------------------------------------------------------------
-    -- 1D Ping-Pong Register Array Definition (1088 depth * 6-bit For Parity Chunk Transpose)
+    -- 1D Ping-Pong Register Array Definition
     --------------------------------------------------------------------
     -- 140 (max q) * 8 = 1120. We use 1120 for 8-byte alignment.
     type reg_arr_t is array(0 to 1119) of std_logic_vector(5 downto 0);
@@ -90,10 +90,19 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal tx_m_offset  : std_logic_vector(12 downto 0); -- Accumulator for M * 45
     signal tx_j_cnt     : std_logic_vector(5 downto 0);
 
+    signal addra        : std_logic_vector(12 downto 0);
     signal ram_wea      : std_logic_vector(0 downto 0);
     signal ram_addra    : std_logic_vector(12 downto 0);
     signal ram_dina     : std_logic_vector(47 downto 0);
     signal frame_ready  : std_logic;
+
+    -- Pipelineing control delay
+    signal tx_run_d1      : std_logic;
+    signal tx_sel_d1      : std_logic;
+    signal frame_ready_d1 : std_logic;
+    -- 8 addr reg of Pipelineing for ram_dina
+    type raddr_arr_t is array(0 to 7) of integer range 0 to 1119;
+    signal raddr_d1 : raddr_arr_t := (others => 0);
 
     -- RAM Read Control Signals(Process 3)
     signal rd_cnt       : std_logic_vector(12 downto 0);
@@ -103,7 +112,6 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal rsta_busy,rstb_busy : std_logic;
     signal rd_en_d1,rd_en_d2   : std_logic;
     
-
 begin
     llr_adjust_ram : ldpc_decode_llr_adjust_ram
 	  PORT MAP (
@@ -167,8 +175,6 @@ begin
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                ping_reg <= (others => (others => '0'));
-                pong_reg <= (others => (others => '0'));
                 llr_in_cnt   <= (others => '0');
                 parity_q_cnt <= (others => '0');
                 parity_j_cnt <= (others => '0');
@@ -242,7 +248,15 @@ begin
                 tx_m_cnt <= (others => '0');
                 tx_m_offset <= (others => '0');
                 frame_ready <= '0';	
+                tx_run_d1   <= '0';
+                tx_sel_d1   <= '0';
+                frame_ready_d1 <= '0';
             else
+                -- Pipelineing control delay
+                tx_run_d1 <= tx_running;
+                tx_sel_d1 <= tx_arr_sel;
+                frame_ready_d1 <= frame_ready;
+
                 -- ram write finish flag for ram rd
                 if (tx_running = '1') and (tx_m_cnt = q_val - 1) and (tx_j_cnt = 44) then
                     frame_ready <= '1';
@@ -250,36 +264,35 @@ begin
                     frame_ready <= '0';
                 end if;
 
-                -- Reg data transpose read & write to RAM(Parity Scatter)
+                -- use Pipelineing rd ping_reg and wr ram
+                -- Reg data transpose read
                 if (tx_running = '1') then
-                    ram_wea <= "1";
-                    
                     -- Calc scatter addr: (INFO_LEN+1)=parity base addr
                     -- tx_m_offset replaces tx_m_cnt*45 multiply,tx_m_cnt++ → RAM addr+45(360/8), reg col-wise wr
                     -- tx_j_cnt++ → RAM addr+1, inc after full col reg wr for next group,
-                    ram_addra <= (INFO_LEN + 1) + tx_m_offset + ("0000000" & tx_j_cnt);
+                    addra <= (INFO_LEN + 1) + tx_m_offset + ("0000000" & tx_j_cnt);
 
                     -- Interleaved rd 8 LLR from reg
                     -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
                     -- tx_arr_sel controls ping-pong switch
                     if (tx_arr_sel = '0') then
-                        ram_dina <= ping_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
-                                    ping_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
-                                    ping_reg(conv_integer(tx_m_cnt));
+                        raddr_d1(0) <= conv_integer(tx_m_cnt);
+                        raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
+                        raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
+                        raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
+                        raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
+                        raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
+                        raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
+                        raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
                     else
-                        ram_dina <= pong_reg(conv_integer(("00" & tx_m_cnt) + q_x7)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x6)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x5)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x4)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x3)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x2)) & 
-                                    pong_reg(conv_integer(("00" & tx_m_cnt) + q_x1)) & 
-                                    pong_reg(conv_integer(tx_m_cnt));
+                        raddr_d1(0) <= conv_integer(tx_m_cnt);
+                        raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
+                        raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
+                        raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
+                        raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
+                        raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
+                        raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
+                        raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
                     end if;
 
                     -- FSM transition & accumulator inc
@@ -290,7 +303,31 @@ begin
                         tx_m_cnt <= tx_m_cnt + 1;
                         tx_m_offset <= tx_m_offset + 45; -- Add 45 per cycle
                     end if;
+                end if;
 
+                -- write to RAM(Parity Scatter)
+                if (tx_run_d1 = '1') then
+                    ram_wea <= "1";
+                    ram_addra <= addra;
+                    if (tx_sel_d1 = '0') then
+                        ram_dina <= ping_reg(raddr_d1(7)) & 
+                                    ping_reg(raddr_d1(6)) & 
+                                    ping_reg(raddr_d1(5)) & 
+                                    ping_reg(raddr_d1(4)) & 
+                                    ping_reg(raddr_d1(3)) & 
+                                    ping_reg(raddr_d1(2)) & 
+                                    ping_reg(raddr_d1(1)) & 
+                                    ping_reg(raddr_d1(0));
+                    else
+                        ram_dina <= pong_reg(raddr_d1(7)) & 
+                                    pong_reg(raddr_d1(6)) & 
+                                    pong_reg(raddr_d1(5)) & 
+                                    pong_reg(raddr_d1(4)) & 
+                                    pong_reg(raddr_d1(3)) & 
+                                    pong_reg(raddr_d1(2)) & 
+                                    pong_reg(raddr_d1(1)) & 
+                                    pong_reg(raddr_d1(0));
+                    end if;
                 -- Infobits directly write to ram(addr sequential increment)
                 elsif (llr_en_d1 = '1' and llr_in_cnt <= INFO_LEN) then
                     ram_wea     <= "1";
@@ -315,16 +352,14 @@ begin
                 rd_cnt    <= (others => '0');
                 ram_addrb <= (others => '0');
                 ov_llr    <= (others => '0');
-                o_llr_en  <= '0';		
-				ov_blk_k  <= (others => '0');				
-				ov_blk_n  <= (others => '1');
+                o_llr_en  <= '0';
             else
                 -- delay for ram read and out
                 rd_en_d1 <= rd_en;
                 rd_en_d2 <= rd_en_d1;
                 o_llr_en <= rd_en_d2;
 
-                if (frame_ready = '1') then
+                if (frame_ready_d1 = '1') then
                     rd_en <= '1';
                     rd_cnt <= (others => '0');
                     ram_addrb <= (others => '0');
@@ -338,11 +373,7 @@ begin
                 end if;
 
                 if (rd_en_d2 = '1') then
-                    ov_llr <= ram_doutb;
-				    ov_blk_k <= Blk_K;
-				    ov_blk_n <= Blk_N;
-                else
-                    ov_llr <= (others => '0');
+                    ov_llr   <= ram_doutb;
                 end if;
             end if;
         end if;
@@ -357,7 +388,9 @@ begin
 			if(i_rst = '1')then
 				Blk_K <= (others => '0');				
 				Blk_N <= (others => '0');			
-				LEN_N <= (others => '0');				
+				LEN_N <= (others => '0');	
+				ov_blk_k  <= (others => '0');				
+				ov_blk_n  <= (others => '1');			
 			else
 				-- if (i_llr_start = '1') then
 				if(iv_len = "00")then
@@ -437,6 +470,8 @@ begin
 						when others => Blk_K <= (others => '0');
 					end case;		
 				end if;
+				ov_blk_k <= Blk_K;
+				ov_blk_n <= Blk_N;
 			end if;
 		end if;
 		-- end if;

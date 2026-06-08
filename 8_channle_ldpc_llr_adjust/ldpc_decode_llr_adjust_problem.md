@@ -13,6 +13,7 @@
 vivado底层逻辑：
 
 - 外部的物理管脚（Pin）是**唯一**的，它无法被复制。如果它直接驱动内部 2000 个触发器，这根线就必须拉得无限长。
+
 - 如果你进门先打一拍（存入 `iv_llr_d1` 寄存器），Vivado 的物理优化（PhysOpt）算法发现这个寄存器扇出太高，它会**自动把这个寄存器克隆出几十份（Register Replication）**，散布到你阵列的各个角落。
 
 **重点：作为子模块仍需要打拍，虽然会导致增加几千LUT资源使用，但会避免以下隐患**
@@ -20,6 +21,25 @@ vivado底层逻辑：
 - **高扇出（High Fan-out）拖死上游：**  `iv_llr` 进来后，要同时驱动几千个 `ping_bank` 寄存器。如果不打拍，这个“1 拖几千”的沉重物理负担，就会顺着网线直接砸给上游模块！上游模块原本好好的时序，会瞬间拖垮。
 
 - **时序无底洞（Timing Blackhole）：** 假如上游模块内部有一段很长的组合逻辑（延迟 3ns），交织器内部又有一段组合逻辑（延迟 3ns）。你们单独看都能跑过 5ns (200MHz)。但如果拼在一起，**中间没有寄存器隔断**，总延迟变成了 `3ns + 3ns = 6ns`，整个大系统的时序当场爆炸！而且查错的时候根本不知道是谁的锅。
+
+- **OBUF（输出缓冲器）的物理开关时间：**在 FPGA 中，把一个微弱的内部信号放大，并驱动到芯片外部真实的物理引脚上（比如驱动一个 3.3V 的外部芯片），物理晶体管的翻转是需要极其庞大能量和时间的。在 Virtex-7 上，这个 OBUF 的固有延迟就是 ~2.45 ns。
+
+  ```vhdl
+      -- =========================================================
+      -- 强制输出寄存器打包到 IOB，消灭外部引脚走线延迟
+      -- =========================================================
+      attribute IOB : string;
+      attribute IOB of ov_blk_k : signal is "true";
+      attribute IOB of ov_blk_n : signal is "true";
+      attribute IOB of ov_llr   : signal is "true";
+      attribute IOB of o_llr_en : signal is "true";
+  ```
+
+  使用Attribute约束，强制IOB 寄存器封装，把输出触发器塞到芯片最边缘、紧挨着物理引脚的 IOB（输入/输出块）里面，如下图：
+
+![image-20260608143315610](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260608143315610.png)
+
+![image-20260608143804290](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260608143804290.png)
 
 **非根本原因（X）**：从1120深度的寄存器数组里根据**动态变量抓取8个独立数据时，需要构建8个庞大的1120选1的多路选择器（MUX）树，既会产生大量的LUT资源，也有可能导致多路选择器扇出**
 
@@ -74,6 +94,8 @@ vivado底层逻辑：
 #### 2.LUT资源消耗
 
 **未优化前资源使用**：
+
+![image-20260607124024954](C:\Users\Administrator\AppData\Roaming\Typora\typora-user-images\image-20260607124024954.png)
 
 可优化
 
