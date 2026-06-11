@@ -10,7 +10,10 @@
 -- Tool versions: 
 -- Description:    DVB-S2/S2X LLR Interleaver utilizing 1D Ping-Pong Register Array
 --                 to perform 48-bit to 48-bit Matrix Transposition.
--- Revision 0.02 - 
+--                 iv_rate:Map DVB iv_modcod to LDPC coderate inside new_dvb_rx_demodcod_message module
+--
+-- Revision 0.02 - Split single-cycle timing (ping/pong_reg rd to ram_dina) into 2-stage pipeline
+--                 change INFO_LEN,q_x7,Assignment conflict and ram_write_pro logic
 ----------------------------------------------------------------------------------
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
@@ -64,7 +67,7 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     -- Q Multiplier Pre-calculation (Pure Combinational)
     signal q_val : std_logic_vector(8 downto 0);
     signal q_ext : std_logic_vector(10 downto 0);
-    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*7=980(10bits)
+    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*8=1120(11bits)
 
     --------------------------------------------------------------------
     -- 1D Ping-Pong Register Array Definition
@@ -148,8 +151,8 @@ begin
                 q_x7  <=  (others => '0');
             else
                 -- Calculate K multiplied by 45
-                -- Example: 90*45 - 1 = 4049
-                INFO_LEN  <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K) - 1; 
+                -- Example: 90*45= 4050
+                INFO_LEN  <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K); 
                 llr_d1    <= iv_llr;
                 llr_en_d1 <= i_llr_en;
 
@@ -160,9 +163,9 @@ begin
                 q_x2 <= q_ext(9 downto 0) & "0";
                 q_x3 <= (q_ext(9 downto 0) & "0") + q_ext;
                 q_x4 <= q_ext(8 downto 0) & "00";
-                q_x5 <= (q_ext(8 downto 0) & "00") + q_ext;
-                q_x6 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0");
-                q_x7 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0") + q_ext;
+                q_x5 <= (q_ext(8 downto 0) & "00")  + q_ext;
+                q_x6 <= (q_ext(8 downto 0) & "00")  + (q_ext(9 downto 0) & "0");
+                q_x7 <= (q_ext(7 downto 0) & "000") - q_ext;
             end if;
         end if;
     end process;
@@ -184,48 +187,45 @@ begin
                 tx_j_cnt     <= (others => '0');
             else
                 -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
-                if (llr_en_d1 = '1') and (llr_in_cnt > INFO_LEN) and (parity_q_cnt = q_val - 1) then
+                if (llr_en_d1 = '1') and (llr_in_cnt >= INFO_LEN) and (parity_q_cnt = q_val - 1) then
                     tx_running <= '1';
                 elsif (tx_running = '1' and tx_m_cnt = q_val - 1) then
                     tx_running <= '0';
                 end if;
 
-                if (llr_en_d1 = '1') then
+                if (llr_en_d1 = '1') and (llr_in_cnt >= INFO_LEN) then 
                     -- checkbits
-                    if (llr_in_cnt > INFO_LEN) then
-                        base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
-                        if pp_arr_wr = '0' then
-                            ping_reg(base_wr+0) <= llr_d1(5 downto 0);   ping_reg(base_wr+1) <= llr_d1(11 downto 6);
-                            ping_reg(base_wr+2) <= llr_d1(17 downto 12); ping_reg(base_wr+3) <= llr_d1(23 downto 18);
-                            ping_reg(base_wr+4) <= llr_d1(29 downto 24); ping_reg(base_wr+5) <= llr_d1(35 downto 30);
-                            ping_reg(base_wr+6) <= llr_d1(41 downto 36); ping_reg(base_wr+7) <= llr_d1(47 downto 42);
-                        else
-                            pong_reg(base_wr+0) <= llr_d1(5 downto 0);   pong_reg(base_wr+1) <= llr_d1(11 downto 6);
-                            pong_reg(base_wr+2) <= llr_d1(17 downto 12); pong_reg(base_wr+3) <= llr_d1(23 downto 18);
-                            pong_reg(base_wr+4) <= llr_d1(29 downto 24); pong_reg(base_wr+5) <= llr_d1(35 downto 30);
-                            pong_reg(base_wr+6) <= llr_d1(41 downto 36); pong_reg(base_wr+7) <= llr_d1(47 downto 42);
-                        end if;
-
-                        -- parity_q_cnt:* 8 for ping reg/pong reg base_wr_addr
-                        -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt
-                        -- tx_j_cnt delays parity_j_cnt after one reg group wr, for ram addr accumulation(<-> reg row change)
-                        if (parity_q_cnt = q_val - 1) then
-                            parity_q_cnt <= (others => '0');
-                            tx_arr_sel <= pp_arr_wr;
-                            tx_j_cnt   <= parity_j_cnt;
-                            
-                            pp_arr_wr <= not pp_arr_wr;
-                            
-                            if parity_j_cnt = 44 then
-                                parity_j_cnt <= (others => '0');
-                            else
-                                parity_j_cnt <= parity_j_cnt + 1;
-                            end if;
-                        else
-                            parity_q_cnt <= parity_q_cnt + 1;
-                        end if;
+                    base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
+                    if pp_arr_wr = '0' then
+                        for i in 0 to 7 loop
+                            ping_reg(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                        end loop;
+                    else
+                        for i in 0 to 7 loop
+                            pong_reg(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                        end loop;
                     end if;
 
+                    -- parity_q_cnt:* 8 for ping reg/pong reg base_wr_addr
+                    -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt
+                    -- tx_j_cnt delays parity_j_cnt after one reg group wr, for ram addr accumulation(<-> reg row change)
+                    if (parity_q_cnt = q_val - 1) then
+                        parity_q_cnt <= (others => '0');
+                        tx_arr_sel <= pp_arr_wr;
+                        tx_j_cnt   <= parity_j_cnt;
+                        
+                        pp_arr_wr <= not pp_arr_wr;
+                        
+                        if parity_j_cnt = 44 then
+                            parity_j_cnt <= (others => '0');
+                        else
+                            parity_j_cnt <= parity_j_cnt + 1;
+                        end if;
+                    else
+                        parity_q_cnt <= parity_q_cnt + 1;
+                    end if;
+                end if;
+                if (llr_en_d1 = '1') then
                     -- llr input global cnt (0 to LEN_N) for infobits write to ram &
                     if (llr_in_cnt = LEN_N) then
                         llr_in_cnt <= (others => '0');
@@ -264,36 +264,24 @@ begin
                     frame_ready <= '0';
                 end if;
 
-                -- use Pipelineing rd ping_reg and wr ram
+                -- use Pipelineing for rd ping_reg and wr ram
                 -- Reg data transpose read
                 if (tx_running = '1') then
                     -- Calc scatter addr: (INFO_LEN+1)=parity base addr
                     -- tx_m_offset replaces tx_m_cnt*45 multiply,tx_m_cnt++ → RAM addr+45(360/8), reg col-wise wr
                     -- tx_j_cnt++ → RAM addr+1, inc after full col reg wr for next group,
-                    addra <= (INFO_LEN + 1) + tx_m_offset + ("0000000" & tx_j_cnt);
+                    addra <= INFO_LEN + tx_m_offset + ("0000000" & tx_j_cnt);
 
                     -- Interleaved rd 8 LLR from reg
                     -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
-                    -- tx_arr_sel controls ping-pong switch
-                    if (tx_arr_sel = '0') then
-                        raddr_d1(0) <= conv_integer(tx_m_cnt);
-                        raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
-                        raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
-                        raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
-                        raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
-                        raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
-                        raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
-                        raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
-                    else
-                        raddr_d1(0) <= conv_integer(tx_m_cnt);
-                        raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
-                        raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
-                        raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
-                        raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
-                        raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
-                        raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
-                        raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
-                    end if;
+                    raddr_d1(0) <= conv_integer(tx_m_cnt);
+                    raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
+                    raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
+                    raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
+                    raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
+                    raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
+                    raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
+                    raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
 
                     -- FSM transition & accumulator inc
                     if (tx_m_cnt = q_val - 1) then
@@ -309,27 +297,15 @@ begin
                 if (tx_run_d1 = '1') then
                     ram_wea <= "1";
                     ram_addra <= addra;
-                    if (tx_sel_d1 = '0') then
-                        ram_dina <= ping_reg(raddr_d1(7)) & 
-                                    ping_reg(raddr_d1(6)) & 
-                                    ping_reg(raddr_d1(5)) & 
-                                    ping_reg(raddr_d1(4)) & 
-                                    ping_reg(raddr_d1(3)) & 
-                                    ping_reg(raddr_d1(2)) & 
-                                    ping_reg(raddr_d1(1)) & 
-                                    ping_reg(raddr_d1(0));
-                    else
-                        ram_dina <= pong_reg(raddr_d1(7)) & 
-                                    pong_reg(raddr_d1(6)) & 
-                                    pong_reg(raddr_d1(5)) & 
-                                    pong_reg(raddr_d1(4)) & 
-                                    pong_reg(raddr_d1(3)) & 
-                                    pong_reg(raddr_d1(2)) & 
-                                    pong_reg(raddr_d1(1)) & 
-                                    pong_reg(raddr_d1(0));
-                    end if;
+                    for i in 0 to 7 loop
+                        if (tx_sel_d1 = '0') then
+                            ram_dina(i*6+5 downto i*6) <= ping_reg(raddr_d1(i));
+                        else
+                            ram_dina(i*6+5 downto i*6) <= pong_reg(raddr_d1(i));
+                        end if;
+                    end loop;
                 -- Infobits directly write to ram(addr sequential increment)
-                elsif (llr_en_d1 = '1' and llr_in_cnt <= INFO_LEN) then
+                elsif (llr_en_d1 = '1' and llr_in_cnt < INFO_LEN) then
                     ram_wea     <= "1";
                     ram_addra   <= llr_in_cnt;
                     ram_dina    <= llr_d1;

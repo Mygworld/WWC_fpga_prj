@@ -10,6 +10,11 @@
 -- Tool versions: 
 -- Description:    DVB-S2/S2X LLR Interleaver utilizing 1D Ping-Pong Register Array
 --                 to perform 48-bit to 48-bit Matrix Transposition.
+--                 iv_rate:Map DVB iv_modcod to LDPC coderate inside new_dvb_rx_demodcod_message module
+--
+-- Revision 0.02 - Split single-cycle timing (ping/pong_reg rd to ram_dina) into 2-stage pipeline 
+-- Revision 0.03 - Split 1120-depth large array into two 560-depth arrays,cut giant MUX long route 
+-- All above edits reduce reg-to-RAM path delay
 ----------------------------------------------------------------------------------
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
@@ -19,50 +24,57 @@ use IEEE.STD_LOGIC_ARITH.ALL;
 entity ldpc_decode_llr_adjust is
     Port ( i_clk    : in  STD_LOGIC;
            i_rst    : in  STD_LOGIC;
-           iv_len   : in  STD_LOGIC_VECTOR (1 downto 0);     
-           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     
-           iv_llr   : in  STD_LOGIC_VECTOR (47 downto 0);    
+           iv_len   : in  STD_LOGIC_VECTOR (1 downto 0);     -- normal/medium/short
+           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     -- 24 + 3 + 7(zai na ge mokuai zhuanhuan)
+           iv_llr   : in  STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch L(pi) input
            i_llr_en : in  STD_LOGIC;
            ov_blk_k : out STD_LOGIC_VECTOR (7 downto 0);  
            ov_blk_n : out STD_LOGIC_VECTOR (7 downto 0);  
-           ov_llr   : out STD_LOGIC_VECTOR (47 downto 0);    
+           ov_llr   : out STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch adjusted out 
            o_llr_en : out STD_LOGIC);
 end ldpc_decode_llr_adjust;
 
 architecture Behavioral of ldpc_decode_llr_adjust is
     --------------------------------------------------------------------
-    -- Unified Single RAM Component
+    -- Unified Single RAM Component (Depth 8192, Addr 13-bit)
     --------------------------------------------------------------------
+    -- info bits wr directly,check bits register-adjusted then wr to matching addr
     COMPONENT ldpc_decode_llr_adjust_ram
       PORT (
         clka      : IN STD_LOGIC;
         wea       : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
         addra     : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
-        dina      : IN STD_LOGIC_VECTOR(47 DOWNTO 0); 
+        dina      : IN STD_LOGIC_VECTOR(47 DOWNTO 0); -- 8-ch input
         rstb      : IN STD_LOGIC;
         clkb      : IN STD_LOGIC;
         rsta_busy : OUT STD_LOGIC;
         rstb_busy : OUT STD_LOGIC;
         addrb     : IN STD_LOGIC_VECTOR(12 DOWNTO 0);
-        doutb     : OUT STD_LOGIC_VECTOR(47 DOWNTO 0) 
+        doutb     : OUT STD_LOGIC_VECTOR(47 DOWNTO 0) -- 8-ch adjusted output
       );
     END COMPONENT;
 
+    -- I/O buffer reg
+    signal llr_d1   : std_logic_vector(47 downto 0);
+    signal llr_en_d1 : std_logic;
     --------------------------------------------------------------------
     -- DVB-S2/S2X Parameters
     --------------------------------------------------------------------
     signal Blk_K    : std_logic_vector(7 downto 0);       
     signal Blk_N    : std_logic_vector(7 downto 0);  
-    signal LEN_N    : std_logic_vector(12 downto 0); 
-    signal INFO_LEN : std_logic_vector(12 downto 0); 
+    signal LEN_N    : std_logic_vector(12 downto 0); -- max = 8099(13bits)
+    signal INFO_LEN : std_logic_vector(12 downto 0); -- max = 64800*9/10 /8 = 7290(13bits)
 
+    -- Q Multiplier Pre-calculation (Pure Combinational)
     signal q_val : std_logic_vector(8 downto 0);
     signal q_ext : std_logic_vector(10 downto 0);
-    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); 
+    signal q_x1, q_x2, q_x3, q_x4, q_x5, q_x6, q_x7 : std_logic_vector(10 downto 0); -- max = 140*8=1120(11bits)
 
     --------------------------------------------------------------------
-    -- 空间切片数组：将 1120 深度一分为二，阻断巨型 MUX 的长布线
+    -- 1D Ping-Pong Register Array Definition
     --------------------------------------------------------------------
+    -- 140 (max q) * 8 = 1120. We use 1120 reg for 8-byte alignment.
+    -- Spatial slice arr: split depth 1120/2, cut giant MUX long route
     type reg_arr_half_t is array(0 to 559) of std_logic_vector(5 downto 0);
     
     signal ping_reg_low  : reg_arr_half_t := (others => (others => '0'));
@@ -71,39 +83,36 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal pong_reg_high : reg_arr_half_t := (others => (others => '0'));
 
     --------------------------------------------------------------------
-    -- 流水线缓冲信号定义
-    --------------------------------------------------------------------
-    type raddr_arr_t is array(0 to 7) of integer range 0 to 1119;
-    signal raddr      : raddr_arr_t := (others => 0);
-    signal raddr_d2   : raddr_arr_t := (others => 0);
-
-    type data_arr_t is array(0 to 7) of std_logic_vector(5 downto 0);
-    signal dl, dh     : data_arr_t := (others => (others => '0'));
-
-    signal tx_run_d1, tx_run_d2   : std_logic := '0';
-    signal tx_sel_d1              : std_logic := '0';
-    signal ram_addra_d1, ram_addra_d2 : std_logic_vector(12 downto 0) := (others => '0');
-    signal frame_ready_early, frame_ready_d1 : std_logic := '0';
-
-    --------------------------------------------------------------------
     -- Control Signals
     --------------------------------------------------------------------
+    -- Reg Control Signals(Process 1)
     signal llr_in_cnt   : std_logic_vector(12 downto 0);
     signal parity_q_cnt : std_logic_vector(8 downto 0);
     signal parity_j_cnt : std_logic_vector(5 downto 0);
     signal pp_arr_wr    : std_logic; 
 
+    -- RAM Write Control Signals(Process 2)
     signal tx_running   : std_logic;
     signal tx_arr_sel   : std_logic;
     signal tx_m_cnt     : std_logic_vector(8 downto 0);
-    signal tx_m_offset  : std_logic_vector(12 downto 0); 
+    signal tx_m_offset  : std_logic_vector(12 downto 0); -- Accumulator for M * 45
     signal tx_j_cnt     : std_logic_vector(5 downto 0);
 
+    signal addra        : std_logic_vector(12 downto 0);
     signal ram_wea      : std_logic_vector(0 downto 0);
     signal ram_addra    : std_logic_vector(12 downto 0);
     signal ram_dina     : std_logic_vector(47 downto 0);
     signal frame_ready  : std_logic;
 
+    -- Pipelineing control delay
+    signal tx_run_d1      : std_logic;
+    signal tx_sel_d1      : std_logic;
+    signal frame_ready_d1 : std_logic;
+    -- 8 addr reg of Pipelineing for ram_dina
+    type raddr_arr_t is array(0 to 7) of integer range 0 to 1119;
+    signal raddr_d1 : raddr_arr_t := (others => 0);
+
+    -- RAM Read Control Signals(Process 3)
     signal rd_cnt       : std_logic_vector(12 downto 0);
     signal rd_en        : std_logic;
     signal ram_addrb    : std_logic_vector(12 downto 0);
@@ -113,61 +122,67 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     
 begin
     llr_adjust_ram : ldpc_decode_llr_adjust_ram
-      PORT MAP (
-         clka      => i_clk,
-         wea       => ram_wea,
-         addra     => ram_addra,
-         dina      => ram_dina,
-         rstb      => i_rst,
-         clkb      => i_clk,      
-         rsta_busy => rsta_busy,      
+	  PORT MAP (
+		 clka      => i_clk,
+		 wea       => ram_wea,
+		 addra     => ram_addra,
+		 dina      => ram_dina,
+		 rstb      => i_rst,
+		 clkb      => i_clk,      
+		 rsta_busy => rsta_busy,      
          rstb_busy => rstb_busy,
-         addrb     => ram_addrb,
-         doutb     => ram_doutb
-      );
+		 addrb     => ram_addrb,
+		 doutb     => ram_doutb
+	  );
 
     -- ==================================================================
-    -- Parameter Computations (恢复了 q_x1~q_x7 的计算)
+    -- Parameter Computations 
     -- ==================================================================
     q_multi_calu_pro:process(i_clk)
     begin
         if(i_clk'event and i_clk = '1')then
             if (i_rst = '1') then
-                INFO_LEN <= (others => '0');
-                q_val    <= (others => '0');
-                q_ext    <= (others => '0');
-                q_x1 <= (others => '0'); q_x2 <= (others => '0'); q_x3 <= (others => '0');
-                q_x4 <= (others => '0'); q_x5 <= (others => '0'); q_x6 <= (others => '0'); q_x7 <= (others => '0');
+                INFO_LEN  <= (others => '0');
+                llr_d1    <= (others => '0');     -- I/O Input Pipelineing
+                llr_en_d1 <= '0';
+                q_val <=  (others => '0');
+                q_ext <=  (others => '0');
+                q_x1  <=  (others => '0'); 
+                q_x2  <=  (others => '0'); 
+                q_x3  <=  (others => '0');
+                q_x4  <=  (others => '0'); 
+                q_x5  <=  (others => '0'); 
+                q_x6  <=  (others => '0'); 
+                q_x7  <=  (others => '0');
             else
-                INFO_LEN <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K) - 1; 
-                
+                -- Calculate K multiplied by 45
+                -- Example: 90*45= 4050
+                INFO_LEN  <= (Blk_K & "00000") + ("00" & Blk_K & "000") + ("000" & Blk_K & "00") + ("00000" & Blk_K); 
+                llr_d1    <= iv_llr;
+                llr_en_d1 <= i_llr_en;
+
                 q_val <= ("0" & Blk_N) - ("0" & Blk_K);
-                q_ext <= "00" & (("0" & Blk_N) - ("0" & Blk_K));
+                q_ext <= "00" & q_val;
 
                 q_x1 <= q_ext;
                 q_x2 <= q_ext(9 downto 0) & "0";
                 q_x3 <= (q_ext(9 downto 0) & "0") + q_ext;
                 q_x4 <= q_ext(8 downto 0) & "00";
-                q_x5 <= (q_ext(8 downto 0) & "00") + q_ext;
-                q_x6 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0");
-                q_x7 <= (q_ext(8 downto 0) & "00") + (q_ext(9 downto 0) & "0") + q_ext;
+                q_x5 <= (q_ext(8 downto 0) & "00")  + q_ext;
+                q_x6 <= (q_ext(8 downto 0) & "00")  + (q_ext(9 downto 0) & "0");
+                q_x7 <= (q_ext(7 downto 0) & "000") - q_ext;
             end if;
         end if;
     end process;
 
     -- ==================================================================
-    -- reg control: 线性写入分片数组
+    -- reg control:Rx checkbits and parity
     -- ==================================================================
     reg_ctrl_pro : process(i_clk)
         variable base_wr : integer range 0 to 1119;
-        variable v_wr_addr : integer range 0 to 1119;
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                ping_reg_low  <= (others => (others => '0'));
-                ping_reg_high <= (others => (others => '0'));
-                pong_reg_low  <= (others => (others => '0'));
-                pong_reg_high <= (others => (others => '0'));
                 llr_in_cnt   <= (others => '0');
                 parity_q_cnt <= (others => '0');
                 parity_j_cnt <= (others => '0');
@@ -176,50 +191,60 @@ begin
                 tx_arr_sel   <= '0';
                 tx_j_cnt     <= (others => '0');
             else
-                if (i_llr_en = '1') and (llr_in_cnt > INFO_LEN) and (parity_q_cnt = q_val - 1) then
+                -- Clear tx_running after Tx proc completes chunk moving,for 360 parallelism
+                if (llr_en_d1 = '1') and (llr_in_cnt >= INFO_LEN) and (parity_q_cnt = q_val - 1) then
                     tx_running <= '1';
                 elsif (tx_running = '1' and tx_m_cnt = q_val - 1) then
                     tx_running <= '0';
                 end if;
 
-                if (i_llr_en = '1') then
-                    if (llr_in_cnt > INFO_LEN) then
-                        base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
-                        
-                        -- 根据物理半区写入数据，不再需要复杂的跨界跳转
-                        for i in 0 to 7 loop
-                            v_wr_addr := base_wr + i;
-                            if pp_arr_wr = '0' then
-                                if v_wr_addr < 560 then
-                                    ping_reg_low(v_wr_addr) <= iv_llr(i*6+5 downto i*6);
-                                else
-                                    ping_reg_high(v_wr_addr - 560) <= iv_llr(i*6+5 downto i*6);
-                                end if;
-                            else
-                                if v_wr_addr < 560 then
-                                    pong_reg_low(v_wr_addr) <= iv_llr(i*6+5 downto i*6);
-                                else
-                                    pong_reg_high(v_wr_addr - 560) <= iv_llr(i*6+5 downto i*6);
-                                end if;
-                            end if;
-                        end loop;
-
-                        if (parity_q_cnt = q_val - 1) then
-                            parity_q_cnt <= (others => '0');
-                            tx_arr_sel   <= pp_arr_wr;
-                            tx_j_cnt     <= parity_j_cnt;
-                            pp_arr_wr    <= not pp_arr_wr;
-                            
-                            if parity_j_cnt = 44 then
-                                parity_j_cnt <= (others => '0');
-                            else
-                                parity_j_cnt <= parity_j_cnt + 1;
-                            end if;
+                if (llr_en_d1 = '1') and (llr_in_cnt >= INFO_LEN) then
+                    -- checkbits
+                    base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
+                    if (pp_arr_wr = '0') then
+                        if (base_wr < 560) then 
+                            for i in 0 to 7 loop
+                                ping_reg_low(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                            end loop;
                         else
-                            parity_q_cnt <= parity_q_cnt + 1;
+                            for i in 0 to 7 loop
+                                ping_reg_high(base_wr-560+i) <= llr_d1(i*6+5 downto i*6);
+                            end loop;
+                        end if;
+                    else
+                        if (base_wr < 560) then 
+                            for i in 0 to 7 loop
+                                pong_reg_low(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                            end loop;
+                        else
+                            for i in 0 to 7 loop
+                                pong_reg_high(base_wr-560+i) <= llr_d1(i*6+5 downto i*6);
+                            end loop;
                         end if;
                     end if;
 
+                    -- parity_q_cnt:* 8 for ping reg/pong reg base_wr_addr
+                    -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt
+                    -- tx_j_cnt delays parity_j_cnt after one reg group wr, for ram addr accumulation(<-> reg row change)
+                    if (parity_q_cnt = q_val - 1) then
+                        parity_q_cnt <= (others => '0');
+                        tx_arr_sel <= pp_arr_wr;
+                        tx_j_cnt   <= parity_j_cnt;
+                        
+                        pp_arr_wr <= not pp_arr_wr;
+                        
+                        if parity_j_cnt = 44 then
+                            parity_j_cnt <= (others => '0');
+                        else
+                            parity_j_cnt <= parity_j_cnt + 1;
+                        end if;
+                    else
+                        parity_q_cnt <= parity_q_cnt + 1;
+                    end if;
+                end if;
+
+                    -- llr input global cnt (0 to LEN_N) for infobits write to ram &
+                if (llr_en_d1 = '1') then
                     if (llr_in_cnt = LEN_N) then
                         llr_in_cnt <= (others => '0');
                     else
@@ -231,133 +256,114 @@ begin
     end process;
 
     -- ==================================================================
-    -- ram wr control: 3-Stage Spatial Pipeline (拯救时序的终极核心)
+    -- ram wr control: infobits directly write,checkbits read from changed reg addr and write to changed ram addr
     -- ==================================================================
     ram_write_pro : process(i_clk)
-        variable v_idx_l, v_idx_h : integer range 0 to 559;
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                ram_wea      <= (others => '0');
-                tx_m_cnt     <= (others => '0');
-                tx_m_offset  <= (others => '0');
-                frame_ready  <= '0'; 
-                ram_addra    <= (others => '0');
-                ram_dina     <= (others => '0');
-                
-                tx_run_d1 <= '0'; tx_run_d2 <= '0';
-                tx_sel_d1 <= '0';
+                ram_wea  <= (others => '0');
+                tx_m_cnt <= (others => '0');
+                tx_m_offset <= (others => '0');
+                frame_ready <= '0';	
+                tx_run_d1   <= '0';
+                tx_sel_d1   <= '0';
+                frame_ready_d1 <= '0';
             else
-                -- 默认值初始化与流水线传递
-                ram_wea <= "0";
-                frame_ready_early <= '0';
-                
+                -- Pipelineing control delay
                 tx_run_d1 <= tx_running;
-                tx_run_d2 <= tx_run_d1;
                 tx_sel_d1 <= tx_arr_sel;
-                
-                ram_addra_d2 <= ram_addra_d1;
-                frame_ready_d1 <= frame_ready_early;
-                frame_ready    <= frame_ready_d1;
+                frame_ready_d1 <= frame_ready;
 
-                -- 直通写控制（最高优先级）
-                if (i_llr_en = '1' and llr_in_cnt <= INFO_LEN) then
-                    ram_wea   <= "1";
-                    ram_addra <= llr_in_cnt;
-                    ram_dina  <= iv_llr;
+                -- ram write finish flag for ram rd
+                if (tx_running = '1') and (tx_m_cnt = q_val - 1) and (tx_j_cnt = 44) then
+                    frame_ready <= '1';
+                else
+                    frame_ready <= '0';
                 end if;
 
-                -- =================================================
-                -- STAGE 1: 地址计算 
-                -- =================================================
+                -- use Pipelineing rd ping_reg and wr ram
+                -- Reg data transpose read
                 if (tx_running = '1') then
-                    ram_addra_d1 <= (INFO_LEN + 1) + tx_m_offset + ("0000000" & tx_j_cnt);
+                    -- Calc scatter addr: (INFO_LEN+1)=parity base addr
+                    -- tx_m_offset replaces tx_m_cnt*45 multiply,tx_m_cnt++ → RAM addr+45(360/8), reg col-wise wr
+                    -- tx_j_cnt++ → RAM addr+1, inc after full col reg wr for next group,
+                    addra <= INFO_LEN + tx_m_offset + ("0000000" & tx_j_cnt);
 
-                    raddr(0) <= conv_integer(tx_m_cnt);
-                    raddr(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
-                    raddr(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
-                    raddr(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
-                    raddr(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
-                    raddr(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
-                    raddr(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
-                    raddr(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
+                    -- Interleaved rd 8 LLR from reg
+                    -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
+                    -- tx_arr_sel controls ping-pong switch
+                    raddr_d1(0) <= conv_integer(tx_m_cnt);
+                    raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
+                    raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
+                    raddr_d1(3) <= conv_integer(("00" & tx_m_cnt) + q_x3);
+                    raddr_d1(4) <= conv_integer(("00" & tx_m_cnt) + q_x4);
+                    raddr_d1(5) <= conv_integer(("00" & tx_m_cnt) + q_x5);
+                    raddr_d1(6) <= conv_integer(("00" & tx_m_cnt) + q_x6);
+                    raddr_d1(7) <= conv_integer(("00" & tx_m_cnt) + q_x7);
 
+                    -- FSM transition & accumulator inc
                     if (tx_m_cnt = q_val - 1) then
                         tx_m_cnt <= (others => '0');
-                        tx_m_offset <= (others => '0');
-                        if (tx_j_cnt = 44) then
-                            frame_ready_early <= '1';
-                        end if;
+                        tx_m_offset <= (others => '0'); -- Reset accum at chunk end
                     else
                         tx_m_cnt <= tx_m_cnt + 1;
-                        tx_m_offset <= tx_m_offset + 45; 
+                        tx_m_offset <= tx_m_offset + 45; -- Add 45 per cycle
                     end if;
                 end if;
 
-                -- =================================================
-                -- STAGE 2: 独立获取左右半区数据 (物理隔断)
-                -- =================================================
+                -- write to RAM(Parity Scatter)
                 if (tx_run_d1 = '1') then
+                    ram_wea <= "1";
+                    ram_addra <= addra;
+                    -- 
                     for i in 0 to 7 loop
-                        if raddr(i) < 560 then
-                            v_idx_l := raddr(i);
-                            v_idx_h := 0;
-                        else
-                            v_idx_l := 0;
-                            v_idx_h := raddr(i) - 560;
-                        end if;
-
-                        if tx_sel_d1 = '0' then
-                            dl(i) <= ping_reg_low(v_idx_l);
-                            dh(i) <= ping_reg_high(v_idx_h);
-                        else
-                            dl(i) <= pong_reg_low(v_idx_l);
-                            dh(i) <= pong_reg_high(v_idx_h);
-                        end if;
-                        
-                        raddr_d2(i) <= raddr(i);
-                    end loop;
-                end if;
-
-                -- =================================================
-                -- STAGE 3: 最终 MUX 拼接与 RAM 写入
-                -- =================================================
-                if (tx_run_d2 = '1') then
-                    ram_wea   <= "1";
-                    ram_addra <= ram_addra_d2;
-                    
-                    -- 使用 for 循环和标准的 if-else，完美兼容 VHDL-93
-                    for i in 0 to 7 loop
-                        if raddr_d2(i) < 560 then
-                            ram_dina(i*6+5 downto i*6) <= dl(i);
-                        else
-                            ram_dina(i*6+5 downto i*6) <= dh(i);
+                        if tx_sel_d1 = '0' then -- Ping
+                            if (raddr_d1(i) < 560) then
+                                ram_dina(i*6+5 downto i*6) <= ping_reg_low(raddr_d1(i));
+                            else
+                                ram_dina(i*6+5 downto i*6) <= ping_reg_high(raddr_d1(i) - 560);
+                            end if;
+                        else                    -- Pong
+                            if (raddr_d1(i) < 560) then
+                                ram_dina(i*6+5 downto i*6) <= pong_reg_low(raddr_d1(i));
+                            else
+                                ram_dina(i*6+5 downto i*6) <= pong_reg_high(raddr_d1(i) - 560);
+                            end if;
                         end if;
                     end loop;
+                -- Infobits directly write to ram(addr sequential increment)
+                elsif (llr_en_d1 = '1' and llr_in_cnt < INFO_LEN) then
+                    ram_wea     <= "1";
+                    ram_addra   <= llr_in_cnt;
+                    ram_dina    <= llr_d1;
+                else
+                    ram_wea     <= "0";
                 end if;
-                
             end if;
         end if;
     end process;
-
     -- ==================================================================
-    -- ram rd control: Seq rd RAM addr after frame_ready assert
+    -- ram rd control: Seq rd RAM addr after frame_ready assert,output llr_adjusted
     -- ==================================================================
     ram_read_pro : process(i_clk)
     begin
         if (i_clk'event and i_clk = '1') then
             if (i_rst = '1') then
-                rd_en     <= '0'; rd_en_d1  <= '0'; rd_en_d2  <= '0';
+                rd_en     <= '0';
+                rd_en_d1  <= '0';
+                rd_en_d2  <= '0';
                 rd_cnt    <= (others => '0');
                 ram_addrb <= (others => '0');
                 ov_llr    <= (others => '0');
                 o_llr_en  <= '0';
             else
+                -- delay for ram read and out
                 rd_en_d1 <= rd_en;
                 rd_en_d2 <= rd_en_d1;
                 o_llr_en <= rd_en_d2;
 
-                if (frame_ready = '1') then
+                if (frame_ready_d1 = '1') then
                     rd_en <= '1';
                     rd_cnt <= (others => '0');
                     ram_addrb <= (others => '0');
@@ -370,7 +376,9 @@ begin
                     end if;
                 end if;
 
-                if (rd_en_d2 = '1') then ov_llr <= ram_doutb; else ov_llr <= (others => '0'); end if;
+                if (rd_en_d2 = '1') then
+                    ov_llr   <= ram_doutb;
+                end if;
             end if;
         end if;
     end process;
@@ -384,9 +392,9 @@ begin
 			if(i_rst = '1')then
 				Blk_K <= (others => '0');				
 				Blk_N <= (others => '0');			
-				LEN_N <= (others => '0');				
-				ov_blk_k <= (others => '0');				
-				ov_blk_n <= (others => '1');				
+				LEN_N <= (others => '0');	
+				ov_blk_k  <= (others => '0');				
+				ov_blk_n  <= (others => '1');			
 			else
 				-- if (i_llr_start = '1') then
 				if(iv_len = "00")then
@@ -466,7 +474,6 @@ begin
 						when others => Blk_K <= (others => '0');
 					end case;		
 				end if;
-				
 				ov_blk_k <= Blk_K;
 				ov_blk_n <= Blk_N;
 			end if;
