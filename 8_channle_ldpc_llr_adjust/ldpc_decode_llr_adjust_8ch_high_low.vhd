@@ -222,6 +222,23 @@ begin
                             end loop;
                         end if;
                     end if;
+                    -- if (base_wr < 560) then 
+                    --     for i in 0 to 7 loop
+                    --         if (pp_arr_wr = '0') then
+                    --             ping_reg_low(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                    --         else
+                    --             pong_reg_low(base_wr+i) <= llr_d1(i*6+5 downto i*6);
+                    --         end if;
+                    --     end loop;
+                    -- else
+                    --     for i in 0 to 7 loop
+                    --         if (pp_arr_wr = '0') then
+                    --             ping_reg_high(base_wr-560+i) <= llr_d1(i*6+5 downto i*6);
+                    --         else
+                    --             pong_reg_high(base_wr-560+i) <= llr_d1(i*6+5 downto i*6);
+                    --         end if;
+                    --     end loop;
+                    -- end if;
 
                     -- parity_q_cnt:* 8 for ping reg/pong reg base_wr_addr
                     -- when count up to q-1, trigger RAM write start(tx_running), ping-pong reg switch & increment parity_j_cnt

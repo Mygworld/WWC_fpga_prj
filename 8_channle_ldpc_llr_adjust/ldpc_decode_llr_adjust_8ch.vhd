@@ -24,7 +24,7 @@ entity ldpc_decode_llr_adjust is
     Port ( i_clk    : in  STD_LOGIC;
            i_rst    : in  STD_LOGIC;
            iv_len   : in  STD_LOGIC_VECTOR (1 downto 0);     -- normal/medium/short
-           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     -- 24 + 3 + 7(zai na ge mokuai zhuanhuan)
+           iv_rate  : in  STD_LOGIC_VECTOR (5 downto 0);     
            iv_llr   : in  STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch L(pi) input
            i_llr_en : in  STD_LOGIC;
            ov_blk_k : out STD_LOGIC_VECTOR (7 downto 0);  
@@ -196,7 +196,7 @@ begin
                 if (llr_en_d1 = '1') and (llr_in_cnt >= INFO_LEN) then 
                     -- checkbits
                     base_wr := conv_integer(parity_q_cnt(7 downto 0) & "000");
-                    if pp_arr_wr = '0' then
+                    if (pp_arr_wr = '0') then
                         for i in 0 to 7 loop
                             ping_reg(base_wr+i) <= llr_d1(i*6+5 downto i*6);
                         end loop;
@@ -216,7 +216,7 @@ begin
                         
                         pp_arr_wr <= not pp_arr_wr;
                         
-                        if parity_j_cnt = 44 then
+                        if (parity_j_cnt = 44) then
                             parity_j_cnt <= (others => '0');
                         else
                             parity_j_cnt <= parity_j_cnt + 1;
