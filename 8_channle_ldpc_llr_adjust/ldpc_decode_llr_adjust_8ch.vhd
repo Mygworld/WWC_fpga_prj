@@ -20,7 +20,7 @@ use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.STD_LOGIC_UNSIGNED.ALL;
 use IEEE.STD_LOGIC_ARITH.ALL;
 
-entity ldpc_decode_llr_adjust is
+entity ldpc_decode_llr_adjust_8ch is
     Port ( i_clk    : in  STD_LOGIC;
            i_rst    : in  STD_LOGIC;
            iv_len   : in  STD_LOGIC_VECTOR (1 downto 0);     -- normal/medium/short
@@ -31,14 +31,14 @@ entity ldpc_decode_llr_adjust is
            ov_blk_n : out STD_LOGIC_VECTOR (7 downto 0);  
            ov_llr   : out STD_LOGIC_VECTOR (47 downto 0);    -- 8-ch adjusted out 
            o_llr_en : out STD_LOGIC);
-end ldpc_decode_llr_adjust;
+end ldpc_decode_llr_adjust_8ch;
 
-architecture Behavioral of ldpc_decode_llr_adjust is
+architecture Behavioral of ldpc_decode_llr_adjust_8ch is
     --------------------------------------------------------------------
     -- Unified Single RAM Component (Depth 8192, Addr 13-bit)
     --------------------------------------------------------------------
     -- info bits wr directly,check bits register-adjusted then wr to matching addr
-    COMPONENT ldpc_decode_llr_adjust_ram
+    COMPONENT ldpc_decode_llr_adjust_8ch_ram
       PORT (
         clka      : IN STD_LOGIC;
         wea       : IN STD_LOGIC_VECTOR(0 DOWNTO 0);
@@ -116,7 +116,7 @@ architecture Behavioral of ldpc_decode_llr_adjust is
     signal rd_en_d1,rd_en_d2   : std_logic;
     
 begin
-    llr_adjust_ram : ldpc_decode_llr_adjust_ram
+    llr_adjust_ram : ldpc_decode_llr_adjust_8ch_ram
 	  PORT MAP (
 		 clka      => i_clk,
 		 wea       => ram_wea,
@@ -138,7 +138,7 @@ begin
         if(i_clk'event and i_clk = '1')then
             if (i_rst = '1') then
                 INFO_LEN  <= (others => '0');
-                llr_d1    <= (others => '0');     -- I/O Input Pipelineing
+                llr_d1    <= (others => '0');     -- I/O Input delay
                 llr_en_d1 <= '0';
                 q_val <=  (others => '0');
                 q_ext <=  (others => '0');
@@ -267,13 +267,13 @@ begin
                 -- use Pipelineing for rd ping_reg and wr ram
                 -- Reg data transpose read
                 if (tx_running = '1') then
-                    -- Calc scatter addr: (INFO_LEN+1)=parity base addr
+                    -- Calc scatter addr: INFO_LEN=parity base addr
                     -- tx_m_offset replaces tx_m_cnt*45 multiply,tx_m_cnt++ → RAM addr+45(360/8), reg col-wise wr
                     -- tx_j_cnt++ → RAM addr+1, inc after full col reg wr for next group,
                     addra <= INFO_LEN + tx_m_offset + ("0000000" & tx_j_cnt);
 
                     -- Interleaved rd 8 LLR from reg
-                    -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8 rows
+                    -- tx_m_cnt: reg col; q_x: reg row, 8 rows per RAM data, ping-pong toggle per 8q data
                     raddr_d1(0) <= conv_integer(tx_m_cnt);
                     raddr_d1(1) <= conv_integer(("00" & tx_m_cnt) + q_x1);
                     raddr_d1(2) <= conv_integer(("00" & tx_m_cnt) + q_x2);
