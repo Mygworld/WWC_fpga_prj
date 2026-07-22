@@ -1,0 +1,12 @@
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_barrel_shifter_360.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'ldpc_decode_barrel_shifter_360'
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_parameter.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'ldpc_decode_parameter'
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_processor_CNU.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'ldpc_decode_processor_CNU'
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_processor.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'ldpc_decode_processor'
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_llr_adjust_8ch.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'ldpc_decode_llr_adjust_8ch'
+INFO: [VRFC 10-163] Analyzing VHDL file "D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/new_dvb_rx_ldpc_decode_8path.vhd" into library work
+INFO: [VRFC 10-3107] analyzing entity 'new_dvb_rx_ldpc_decode_8path'

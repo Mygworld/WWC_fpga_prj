@@ -25,6 +25,10 @@ use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.STD_LOGIC_ARITH.ALL;
 use IEEE.STD_LOGIC_UNSIGNED.ALL;
 
+use ieee.std_logic_textio.all; 
+library std;
+use std.textio.all;  
+
 -- Uncomment the following library declaration if using
 -- arithmetic functions with Signed or Unsigned values
 --use IEEE.NUMERIC_STD.ALL;
@@ -1112,5 +1116,70 @@ begin
 		end if;
 	end process;	
 	
+		-- =========================================================================
+-- ����ר�ã����м��ź�д�� TXT �ļ� (�ۺ�ʱ���Զ�����)
+-- =========================================================================
+-- synthesis translate_off
+debug_dump_process : process(i_clk)
+    -- ����Ҫ���ɵ� txt �ļ� (�������к����ǻ��������� Vivado/Modelsim ���̸�Ŀ¼��)
+    file f_llr       : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_01_llr_ram.txt";
+    file f_vnu       : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_02_vnu_data.txt";
+    file f_shifter   : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_03_shifter_out.txt";
+    file f_cnu       : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_04_cnu_out.txt";
+    file f_sum       : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_05_sum_ram.txt";
+    file f_temp      : text open write_mode is "D:/wwc_prj/vivado_vhdl/ldpc_matlab/tmp_code_decode/dump_06_temp_ram.txt";
+
+    variable l_llr     : line;
+    variable l_vnu     : line;
+    variable l_shifter : line;
+    variable l_cnu     : line;
+    variable l_sum     : line;
+    variable l_temp    : line;
+begin
+    if rising_edge(i_clk) then
+        if i_rst = '0' then
+            
+            -- 1. ץȡ LLR RAM �������� (������ VNU �����ͬһ��ץȡ)
+            -- �뽫 ctrl_out_d3 �滻Ϊ��ʵ�ʴ����� VNU ������Ч����һ��ʹ��
+            if ((ctrl_out_d3 = '1' and temp_ram_state_d3 = '0') or decode_finish_en_d4 = '1') then 
+                hwrite(l_llr, llr_ram_doutb_d1); -- ��16����д��
+                writeline(f_llr, l_llr);
+            end if;
+
+            -- 2. ץȡ VNU ������ (���� LLR+SUM-TEMP �� 3960bit)
+            if ((ctrl_out_d4 = '1' and temp_ram_state_d4 = '0') or decode_finish_en_d4 = '1') then 
+                hwrite(l_vnu, vnu_data);
+                writeline(f_vnu, l_vnu);
+            end if;
+
+            -- 3. ץȡ Shifter Out ��λ��� (����/������ɣ�����ץ��һ��)
+            if (ctrl_out_d8 = '1') then 
+                hwrite(l_shifter, shifter_out);
+                writeline(f_shifter, l_shifter);
+            end if;
+
+            -- 4. ץȡ CNU У��ڵ���½��
+            if (ctrl_out_d4 = '1' and temp_ram_state_d3 = '1') then 
+                hwrite(l_cnu, decode_processor_out_d5);
+                writeline(f_cnu, l_cnu);
+            end if;
+
+            -- 5. ץȡ SUM RAM �������� (���� VNU �ۼ�ǰ)
+            if ((ctrl_out_d3 = '1' and temp_ram_state_d3 = '0') or decode_finish_en_d4 = '1') then 
+                hwrite(l_sum, sum_ram_doutb_d1);
+                writeline(f_sum, l_sum);
+            end if;
+
+            -- 6. ץȡ TEMP RAM �������� (����ؼ�����ʷ��Ϣ)
+            if (ctrl_out_d3 = '1' and temp_ram_state_d3 = '0') then 
+                hwrite(l_temp, temp_ram_doutb_d5);
+                writeline(f_temp, l_temp);
+            end if;
+
+        end if;
+    end if;
+end process;
+-- synthesis translate_on
+-- =========================================================================
 
 end Behavioral;

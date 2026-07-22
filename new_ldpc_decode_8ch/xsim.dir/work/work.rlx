@@ -1,0 +1,10 @@
+0.6
+2018.3
+Dec  7 2018
+00:33:28
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_barrel_shifter_360.vhd,1784539864,vhdl2008,,,,ldpc_decode_barrel_shifter_360,,,,,,,,
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_llr_adjust_8ch.vhd,1782790543,vhdl2008,,,,ldpc_decode_llr_adjust_8ch,,,,,,,,
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_parameter.vhd,1784530757,vhdl2008,,,,ldpc_decode_parameter,,,,,,,,
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_processor.vhd,1747708420,vhdl2008,,,,ldpc_decode_processor,,,,,,,,
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_processor_CNU.vhd,1782789108,vhdl2008,D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/ldpc_decode_processor.vhd,,,ldpc_decode_processor_cnu,,,,,,,,
+D:/wwc_prj/vivado_vhdl/ldpc_prj/current_ldpc_git/new_ldpc_decode_8ch/new_dvb_rx_ldpc_decode_8path.vhd,1784624327,vhdl2008,,,,new_dvb_rx_ldpc_decode_8path,,,,,,,,

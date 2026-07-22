@@ -1,0 +1,365 @@
+function [decode, dbg] = dvbs2_ldpc_layered_3_4_short_fixed_demo(rawData, LLR_hw, iterNum)
+%DVBS2_LDPC_LAYERED_3_4_SHORT_FIXED_DEMO DVB-S2 短帧 3/4 分层译码定点参考模型。
+%
+% 适用对象 / Target
+%   本函数对应当前工程的 DVB-S2 短帧 3/4（工程内原参数名称为 11/15）分层译码结构：
+%       N = 16200，K = 11880，Z = 360，M/Z = 12 层。
+%   rawData 由外部测试程序或参数模块提供；本函数不自行生成校验矩阵参数。
+%
+% 输入 / Inputs
+%   rawData(:,1) : weight（当前槽是否属于本层）。每层第一个 weight=0 为层结束槽。
+%   rawData(:,2) : 原始 pos_en 提示；仅保留用于与 ROM 对照，本模型不参与计算。
+%   rawData(:,3) : pos，变量节点宏块地址，正常范围为 1...45。
+%   rawData(:,4) : 9 bit 桶形移位控制字（十进制表示）。
+%   LLR_hw       : 16200 个已按硬件校验位重排后的量化 LLR。
+%   iterNum      : 完整分层迭代次数。
+%
+% rawData 行组织 / rawData layout
+%   第 1...156 行：正向移位参数，送入 CNU 前使用。
+%   第 157...312 行：反向移位参数，CNU 输出回写时使用。
+%   若只提供前 156 行，则按 ldpc_decode_parameter.vhd 的旧反向规则推导反向移位。
+%
+% 两块核心 RAM / Core memories
+%   soft_total_ram(pos,:) : 当前变量节点总软信息 APP，11 bit 有符号环绕。
+%   check_msg_ram(edge,:) : 每条真实边保存的旧校验消息 R_old，6 bit 有符号。
+%                              edge 即 msg_addr；它只对真实边递增，不对 dummy 递增。
+%
+% 每条真实边的公式 / Per-real-edge equations
+%   old_check_msg    = check_msg_ram(msg_addr,:)
+%   v2c_msg          = soft_total_ram(pos,:) - old_check_msg
+%   q_chk            = forward_shift(sat6(v2c_msg))
+%   new_check_msg    = reverse_shift(CNU(q_chk))
+%   soft_total_ram(pos,:) = soft_total_ram(pos,:) + new_check_msg - old_check_msg
+%   check_msg_ram(msg_addr,:) = new_check_msg
+%
+% pos=181 是 dummy 气泡，不是实际变量节点：
+%   它以 +31 送入 CNU 以保持 13 槽的最小值查询节拍；但不占用 msg_addr，
+%   也绝不读写 soft_total_ram 和 check_msg_ram。
+%
+% 同一层中若多个真实边使用同一个 pos：
+%   所有 Q 在本层开始时先被读出并送入 CNU；CNU 输出阶段则按槽顺序进行
+%   soft_total_ram(pos,:) += delta。因此该模型等价于硬件中的读后写旁路 / write bypass。
+
+    % 固定码型参数 / Fixed code parameters.
+    Z = 360;
+    NUM_VN_BLOCKS = 45;
+    NUM_CN_LAYERS = 12;
+    SLOT_PER_LAYER = 13;
+    FWD_ROWS = NUM_CN_LAYERS * SLOT_PER_LAYER;
+    INFO_BLOCKS = 33;
+    DUMMY_POS = 181;
+
+    validate_inputs(rawData, LLR_hw, iterNum, FWD_ROWS, Z, NUM_VN_BLOCKS);
+    use_raw_reverse_rows = size(rawData, 1) >= 2 * FWD_ROWS;
+
+    % 从外部参数流建立固定的真实边表；同一 msg_addr 在每次迭代中复用。
+    % Build the fixed real-edge table from the external parameter stream.
+    edgeTbl = build_layered_edge_table(rawData, use_raw_reverse_rows, ...
+                                       NUM_CN_LAYERS, SLOT_PER_LAYER, DUMMY_POS);
+    numEdges = numel(edgeTbl);
+
+    % 输入 LLR 已按硬件顺序排列；第 1 个维度就是 pos 地址。
+    % The first dimension of this RAM is the 1-based MATLAB pos address.
+    llr_ram = reshape(double(LLR_hw(:).'), Z, NUM_VN_BLOCKS).';
+    soft_total_ram = wrap_s11(llr_ram);
+
+    % 初始时所有边都还没有历史 CNU 消息，所以 R_old=0。
+    % Initially every old check-node message is zero.
+    check_msg_ram = zeros(numEdges, Z);
+
+    % 调试信息 / Debug information.
+    dbg = struct();
+    dbg.numEdges = numEdges;
+    dbg.edgeTbl = edgeTbl;
+    dbg.edgesPerLayer = count_edges_per_layer(edgeTbl, NUM_CN_LAYERS);
+    dbg.iterNum = iterNum;
+
+    for iter = 1:iterNum %#ok<NASGU>
+        msg_addr = 0;  % 每轮都按相同边表顺序重新寻址 / restart edge addressing.
+
+        for layer = 1:NUM_CN_LAYERS
+            slots = (layer - 1) * SLOT_PER_LAYER + (1:SLOT_PER_LAYER);
+
+            % 阶段 A：先收集本层所有 CNU 输入。该阶段不写 soft_total_ram，
+            % 所以同一层的所有边都使用进入本层时的 soft_total。
+            % Stage A: collect all layer inputs before any update is written back.
+            q_chk_slots = zeros(0, Z);
+            slot_is_edge = false(1, 0);
+
+            % 这是硬件 context FIFO 的功能级模型，仅为真实边保存上下文。
+            % Function-level equivalent of the context FIFO for real edges only.
+            ctx_msg_addr = zeros(1, 0);
+            ctx_pos = zeros(1, 0);
+            ctx_old_check_msg = zeros(0, Z);
+            ctx_rev_shift = zeros(1, 0);
+
+            for s = slots
+                weight = rawData(s, 1);
+                pos = rawData(s, 3);
+                fwd_shift = rawData(s, 4);
+
+                % 每层 weight=0 的槽是结束标志，不是 CNU 输入。
+                % weight=0 marks the end of this layer and is not a CNU input.
+                if weight == 0
+                    break;
+                end
+
+                [s87, s64, s30] = decode_shift_code(fwd_shift);
+
+                if pos == DUMMY_POS
+                    % dummy 在 CNU 最小值搜索中以 +31 参与，但不会被回写。
+                    % A dummy bubble enters the CNU as +31 and is never written back.
+                    q_chk_slots(end + 1, :) = hw_barrel_shift(ones(1, Z) * 31, s87, s64, s30); %#ok<AGROW>
+                    slot_is_edge(end + 1) = false; %#ok<AGROW>
+                    continue;
+                end
+
+                % 真实边：按 msg_addr 取出本边历史 R_old。
+                % Real edge: read this edge's historical C2V message R_old.
+                msg_addr = msg_addr + 1;
+                old_check_msg = check_msg_ram(msg_addr, :);
+
+                % 先在变量节点顺序完成 APP-R_old，再限幅到 6 bit，最后正向移位。
+                % APP-R_old is calculated in variable-node order before forward shifting.
+                v2c_msg = wrap_s11(soft_total_ram(pos, :) - ...
+                                             sign_extend_s6_to_s11(old_check_msg));
+                q_var_sat6 = sat_s11_to_s6(v2c_msg);
+                q_chk_slots(end + 1, :) = hw_barrel_shift(q_var_sat6, s87, s64, s30); %#ok<AGROW>
+                slot_is_edge(end + 1) = true; %#ok<AGROW>
+
+                % 保存 CNU 输出时所需的上下文。
+                % Save the context that is paired with the later CNU result.
+                ctx_msg_addr(end + 1) = msg_addr; %#ok<AGROW>
+                ctx_pos(end + 1) = pos; %#ok<AGROW>
+                ctx_old_check_msg(end + 1, :) = old_check_msg; %#ok<AGROW>
+                ctx_rev_shift(end + 1) = get_reverse_shift(rawData, s, FWD_ROWS, use_raw_reverse_rows); %#ok<AGROW>
+            end
+
+            if isempty(q_chk_slots)
+                continue;
+            end
+
+            % 阶段 B：同层各槽在校验节点顺序完成 min1/min2/总符号计算。
+            % Stage B: CNU min1/min2/overall-sign calculation in check-node order.
+            r_chk_slots = cnu_norm_min_sum_360(q_chk_slots);
+
+            % 阶段 C：输出反向移位，并以 new-old 的增量原位更新两个 RAM。
+            % Stage C: reverse shift and update the two RAMs in place using delta=new-old.
+            ctx_rd = 0;
+            for k = 1:size(r_chk_slots, 1)
+                if ~slot_is_edge(k)
+                    continue;
+                end
+
+                ctx_rd = ctx_rd + 1;
+                edge = ctx_msg_addr(ctx_rd);
+                pos = ctx_pos(ctx_rd);
+                old_check_msg = ctx_old_check_msg(ctx_rd, :);
+
+                [s87, s64, s30] = decode_shift_code(ctx_rev_shift(ctx_rd));
+                new_check_msg = hw_barrel_shift(r_chk_slots(k, :), s87, s64, s30);
+                new_check_msg = sat_s11_to_s6(new_check_msg);
+
+                % 注意这里必须读取“当前” soft_total_ram(pos,:)：若同层前一条边刚刚
+                % 写过相同 pos，这里得到的是已更新值，等价于 RTL 的 bypass_data。
+                % Read the current value here to model RAW forwarding for duplicate pos.
+                check_msg_delta = sign_extend_s6_to_s11(new_check_msg) - ...
+                                  sign_extend_s6_to_s11(old_check_msg);
+                soft_total_ram(pos, :) = wrap_s11(soft_total_ram(pos, :) + check_msg_delta);
+                check_msg_ram(edge, :) = new_check_msg;
+            end
+        end
+
+        % 一个完整迭代必须刚好遍历所有真实边。
+        % One complete iteration must traverse every real edge exactly once.
+        assert(msg_addr == numEdges, 'msg_addr does not match the real-edge table.');
+    end
+
+    % 仅对前 33 个信息宏块作硬判决，输出长度为 33*360=11880 bit。
+    % Hard decision is made from the current total soft information.
+    decode = (soft_total_ram(1:INFO_BLOCKS, :) < 0).';
+    decode = decode(:).';
+end
+
+function validate_inputs(rawData, LLR_hw, iterNum, fwdRows, z, numVnBlocks)
+% 输入尺寸和类型检查 / Input shape and type checks.
+    if ~isnumeric(rawData) || size(rawData, 2) < 4 || size(rawData, 1) < fwdRows
+        error('rawData must be a numeric matrix with at least 156 rows and 4 columns.');
+    end
+    if ~isnumeric(LLR_hw) || numel(LLR_hw) ~= z * numVnBlocks
+        error('LLR_hw must contain exactly 16200 hardware-ordered LLR values.');
+    end
+    if ~isscalar(iterNum) || iterNum < 0 || iterNum ~= floor(iterNum)
+        error('iterNum must be a non-negative integer scalar.');
+    end
+
+    % 对前 156 行作基本范围检查；181 是唯一合法 dummy 地址。
+    active = rawData(1:fwdRows, 1) ~= 0;
+    pos = rawData(1:fwdRows, 3);
+    badPos = active & (pos ~= 181) & (pos < 1 | pos > numVnBlocks | pos ~= floor(pos));
+    if any(badPos)
+        error('A real-edge pos in rawData must be an integer in the range 1...45.');
+    end
+    shifts = rawData(1:fwdRows, 4);
+    if any(shifts < 0 | shifts > 511 | shifts ~= floor(shifts))
+        error('Forward shift_code must be an integer in the range 0...511.');
+    end
+
+    % 若提供了后半段反向参数，则确认它仍与前半段属于同一槽位。
+    % This catches accidental pairing of a forward schedule with a wrong reverse schedule.
+    if size(rawData, 1) >= 2 * fwdRows
+        reverseRows = rawData(fwdRows + (1:fwdRows), :);
+        if any(reverseRows(:, 1) ~= rawData(1:fwdRows, 1)) || ...
+           any(reverseRows(:, 3) ~= rawData(1:fwdRows, 3))
+            error('Forward and reverse rawData halves do not describe the same schedule slots.');
+        end
+        reverseShifts = reverseRows(:, 4);
+        if any(reverseShifts < 0 | reverseShifts > 511 | reverseShifts ~= floor(reverseShifts))
+            error('Reverse shift_code must be an integer in the range 0...511.');
+        end
+    end
+end
+
+function edgeTbl = build_layered_edge_table(rawData, useRawReverseRows, numCnLayers, slotPerLayer, dummyPos)
+% 根据正向参数建立“真实边 -> msg_addr”表 / Build real-edge to msg_addr table.
+    fwdRows = numCnLayers * slotPerLayer;
+    edgeTbl = struct('msg_addr', {}, 'layer', {}, 'slot', {}, 'row', {}, ...
+                     'pos', {}, 'fwd_shift', {}, 'rev_shift', {});
+    edge = 0;
+
+    for row = 1:fwdRows
+        if rawData(row, 1) == 0 || rawData(row, 3) == dummyPos
+            continue;
+        end
+
+        edge = edge + 1;
+        edgeTbl(edge).msg_addr = edge;
+        edgeTbl(edge).layer = ceil(row / slotPerLayer);
+        edgeTbl(edge).slot = mod(row - 1, slotPerLayer) + 1;
+        edgeTbl(edge).row = row;
+        edgeTbl(edge).pos = rawData(row, 3);
+        edgeTbl(edge).fwd_shift = rawData(row, 4);
+        edgeTbl(edge).rev_shift = get_reverse_shift(rawData, row, fwdRows, useRawReverseRows);
+    end
+end
+
+function counts = count_edges_per_layer(edgeTbl, numCnLayers)
+% 统计每层真实边数 / Count real edges in each layer.
+    counts = zeros(numCnLayers, 1);
+    for edge = 1:numel(edgeTbl)
+        counts(edgeTbl(edge).layer) = counts(edgeTbl(edge).layer) + 1;
+    end
+end
+
+function revShift = get_reverse_shift(rawData, row, fwdRows, useRawReverseRows)
+% 反向移位优先使用 rawData 后半段；否则复用旧 parameter 模块的求逆规则。
+% Prefer rawData reverse rows; otherwise use the old parameter-module reverse rule.
+    if useRawReverseRows
+        revShift = rawData(row + fwdRows, 4);
+    else
+        revShift = reverse_shift_code(rawData(row, 4));
+    end
+end
+
+function y = cnu_norm_min_sum_360(qMsgs)
+% 360 路归一化最小和 CNU；归一化系数固定为 floor(magnitude*28/32)。
+% 360-lane normalized min-sum CNU with the fixed 28/32 coefficient.
+    mags = abs(qMsgs);
+    signs = sign(qMsgs);
+    signs(signs == 0) = 1;  % 硬件中 0 的符号位为 0，即正数 / zero is positive.
+
+    totalSign = prod(signs, 1);
+
+    % min() 对并列最小值取最先出现的槽，匹配 CNU 中“严格小于”比较器。
+    % Then mask that first slot to obtain min2; a tie naturally makes min2=min1.
+    [min1, minIndex] = min(mags, [], 1);
+    maskedMags = mags;
+    columns = 1:size(mags, 2);
+    maskedMags(sub2ind(size(maskedMags), minIndex, columns)) = inf;
+    min2 = min(maskedMags, [], 1);
+    if size(qMsgs, 1) == 1
+        min2 = min1;
+    end
+
+    y = zeros(size(qMsgs));
+    for slot = 1:size(qMsgs, 1)
+        outMag = min1;
+        isMin = (minIndex == slot);
+        outMag(isMin) = min2(isMin);
+
+        % 与目标新结构一致：固定 28/32，不使用旧 CNU 中的 31/32 首段系数。
+        normMag = floor((outMag * 28) / 32);
+        y(slot, :) = sat_s11_to_s6(normMag .* (totalSign .* signs(slot, :)));
+    end
+end
+
+function [s87, s64, s30] = decode_shift_code(shiftCode)
+% 将 9 bit 移位控制字拆为 2 bit、3 bit、4 bit 三段。
+% Split the 9-bit shift control word into its three barrel-shifter fields.
+    s87 = double(floor(shiftCode / 128));
+    s64 = double(mod(floor(shiftCode / 16), 8));
+    s30 = double(mod(shiftCode, 16));
+end
+
+function reverseCode = reverse_shift_code(shiftCode)
+% 与 ldpc_decode_parameter.vhd 的 state=0 分支完全相同的反向控制字规则。
+% Same inverse-control rule as the state=0 branch in ldpc_decode_parameter.vhd.
+    bits = dec2bin(shiftCode, 9) - '0';
+    b87 = bits(1:2);
+    b64 = bits(3:5);
+    b30 = bits(6:9);
+
+    r64 = 1 - b64;
+    if all(b64 == 0)
+        r87 = b87;
+        r30 = b30;
+    else
+        r87 = 1 - b87;
+        r30 = 1 - b30;
+    end
+    reverseCode = bin2dec(char([r87, r64, r30] + '0'));
+end
+
+function y = hw_barrel_shift(x, s87, s64, s30)
+% 360 路三级桶形移位器的软件等价模型，方向和边界填充值与 RTL 保持一致。
+% Software equivalent of the 360-lane, three-stage RTL barrel shifter.
+    y = circshift(x, -s87 * 90, 2);
+    switch s64
+        case 0
+            y = [31, y(1:end-1)];
+        case 1
+            % 不移位 / no shift.
+        case 2
+            y = circshift(y, -15, 2);
+        case 3
+            y = circshift(y, -30, 2);
+        case 4
+            y = circshift(y, -45, 2);
+        case 5
+            y = circshift(y, -60, 2);
+        case 6
+            y = circshift(y, -75, 2);
+        case 7
+            y = [y(2:end), 0];
+    end
+    y = circshift(y, -s30, 2);
+end
+
+function y = sat_s11_to_s6(x)
+% 与原工程一致的 6 bit 消息限幅：正溢出映射为 +30，负溢出映射为 -31。
+% Match the legacy hardware saturation behavior: +overflow -> +30, -overflow -> -31.
+    y = x;
+    y(x > 31) = 30;
+    y(x < -31) = -31;
+end
+
+function y = sign_extend_s6_to_s11(x)
+% MATLAB 的 double 已经是有符号数；此函数只标注 RTL 中的 6 bit 符号扩展步骤。
+% MATLAB doubles are signed already; this function documents the RTL sign extension.
+    y = x;
+end
+
+function y = wrap_s11(x)
+% 11 bit 二补码自然环绕 / Natural 11-bit two's-complement wraparound.
+    y = mod(x + 1024, 2048) - 1024;
+end
